@@ -1,41 +1,40 @@
-# Vortex Latice Method implementation
+# Vortex Lattice Method implementation
 
-A study focused on implementing a clear and instructive program to compute VLM for simple yet generic aerodinamic configurations.
+A study focused on implementing a clear and instructive program to compute VLM for simple yet generic aerodynamic configurations.
 
 ![Full Aircraft](docs/full_plot.png)
-
 
 ## Context
 
 The current implementation is based on the book Flight Vehicle Aerodynamics, by Mark Drela, on section 6.5.
 
-thge code consist of a potential method for solving 3D flows. It can be very usefull for configuration analysis, load estimation, trim condition, stability and control derivatives.
+The code consists of a potential method for solving 3D flows. It can be very useful for configuration analysis, load estimation, trim conditions, stability and control derivatives.
 
-The geometry of the configuration is highly simplified, any volumes of the geometry and its effects are ignored. The only geometryconsidereations taken into accoun are deflections and surface camber and this is achieved by the rotation of the surface normals.  
+The geometry of the configuration is highly simplified, any volumes of the geometry and its effects are ignored. The only geometry considerations taken into account are deflections and surface camber, and this is achieved by the rotation of the surface normals.
 
-The current implementation use the JAX library as its numerical engine. This choice was made to make use of the Automatic Diferentiation, this could be useful on trade and optimization studies and is used for calculation of control derivatives.JAX also allows for the user to especify which hardware the program runs on, either the CPU or the GPU, enver TPU if avaliable and offers series of function transformations that are usefull for paralell computation and vectorization.
+The current implementation uses the JAX library as its numerical engine. This choice was made to make use of Automatic Differentiation, which could be useful in trade and optimization studies and is used for calculation of control derivatives. JAX also allows the user to specify which hardware the program runs on, either the CPU, the GPU, or even the TPU if available, and offers a series of function transformations that are useful for parallel computation and vectorization.
 
 ## Theory
 
-The VLM approach simplifies each lifting surface into a vortex sheet, and each vortex sheet is split into pannels. Each panel has a horse-shoe vortex attached to the quarter cord of the panel.
+The VLM approach simplifies each lifting surface into a vortex sheet, and each vortex sheet is split into panels. Each panel has a horse-shoe vortex attached to the quarter chord of the panel.
 
-The influence of each vortex at each panel is calculated at the a colocation point, generally placed at the three quarter cord of the panel. The strenght of all the vortex for the surfaces are such that the induced velocity at such colocation points is paralell to the surface. This condition allow for the cration of a linear systems to compute the vorticity distribution that satisfies the condition at all panels.
+The influence of each vortex at each panel is calculated at a collocation point, generally placed at the three-quarter chord of the panel. The strength of all the vortices of the surfaces is such that the induced velocity at such collocation points is parallel to the surface. This condition allows for the creation of a linear system to compute the vorticity distribution that satisfies the condition at all panels.
 
-With the panel vorticity computed it is possible to compute the force at each pannel and in the whole surface.
+With the panel vorticity computed it is possible to compute the force at each panel and in the whole surface.
 
-For a more details see the reference material in Flight Vehicles Aerodynamics, by Mark Drela.
+For more details see the reference material in Flight Vehicle Aerodynamics, by Mark Drela.
 
 ## Implementation
 
 The program is composed of two classes: Surfaces and Aircraft.
 
-The Surface class takes geometric parameters for the deffinition of lifting surfaces and discretization. From this it derives a mesh os panel and compute all relevant components for the construction of the linear system of equations. It also has means to draw its own geometry on a figure, that can be passed to other surfaces to create a 3D representation of a full aircraft.
+The Surface class takes geometric parameters for the definition of lifting surfaces and discretization. From this it derives a mesh of panels and computes all relevant components for the construction of the linear system of equations. It also has means to draw its own geometry on a figure, which can be passed to other surfaces to create a 3D representation of a full aircraft.
 
-The Aircraft class is responsible for agregating all the surfaces into a single system of equations. It computes the matrix of influences and the contour conditions, taking into account the effects of any control surfaces.
+The Aircraft class is responsible for aggregating all the surfaces into a single system of equations. It computes the matrix of influences and the boundary conditions, taking into account the effects of any control surfaces.
 
-From these the circulation at each pannel is computed and the aerodynamic forces and moments. From this the coeficients are easily computable with an adimentionalization an a rotation to the wind axes. Using the facilities of automatic diferentiation from JAX it is possible to the compute the stability derivatives and the control derivatives for each coeficient.
+From these the circulation at each panel is computed, along with the aerodynamic forces and moments. From this the coefficients are easily computable with a nondimensionalization and a rotation to the wind axes. Using the facilities of automatic differentiation from JAX it is possible to compute the stability derivatives and the control derivatives for each coefficient.
 
-A easy result from this is the possibility for computing the derivative of pitch ($C_m$) with respect to AoA ($\alpha$). With it the Neutral Point is easily found at $dC_m/d\alpha = 0$ and the longituidinal stability can be infered by comparing the position of this to the center of gravity. These point area automatically ploted into the aircrafts plot rourtine. 
+An easy result from this is the possibility of computing the derivative of pitch ($C_m$) with respect to AoA ($\alpha$). With it the Neutral Point is easily found at $dC_m/d\alpha = 0$, and the longitudinal stability can be inferred by comparing the position of this to the center of gravity. These points are automatically plotted into the aircraft's plot routine.
 
 ## Tests
 
@@ -280,14 +279,12 @@ small (~0.004-0.005) and of the same sign and order of magnitude;
 
 ## Limitations
 
-The curent state of the code does not take into account any body elements and its tail refinement seems to have a sever impact on the prediction of the position of the neutral point of the aircraft.
+The current state of the code does not take into account any body elements, and its tail refinement seems to have a severe impact on the prediction of the position of the neutral point of the aircraft.
 
-A the present code was designed with clarety in mind as a study for the Vortex Latice Method its computational performance is sub-optimal both in the sense of time and memory alocation. As such this limits the application for MDO and optimization, which need to explore a large number of possibilities.
+As the present code was designed with clarity in mind as a study for the Vortex Lattice Method, its computational performance is sub-optimal both in the sense of time and memory allocation. As such, this limits its application to MDO and optimization, which need to explore a large number of possibilities.
 
 ## Conclusions
 
-The present code is a clear and objective  tool for the learning and exploration of diferent aircraft configurations. it delivers a flexible fromat for study of diferent arquitectures and allows for quick and easy iteration on the geometry. 
+The present code is a clear and objective tool for the learning and exploration of different aircraft configurations. It delivers a flexible format for study of different architectures and allows for quick and easy iteration on the geometry.
 
-
-
-Though not guarantied some resonable precision and agreement with classical and verified tool was obtained.
+Though not guaranteed, reasonable precision and agreement with a classical and verified tool was obtained.
