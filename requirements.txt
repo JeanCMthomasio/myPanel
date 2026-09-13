@@ -1,0 +1,6 @@
+jax>=0.6.2
+matplotlib>=3.10.5
+numpy>=2.2.6
+
+# only needed for the AeroSandbox comparison scripts in docs/
+aerosandbox>=4.2.8
