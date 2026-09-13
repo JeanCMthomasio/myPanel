@@ -2,7 +2,7 @@
 
 A study focused on implementing a clear and instructive program to compute VLM for simple yet generic aerodinamic configurations.
 
-![Full Aircraft](docs\full_plot.png)
+![Full Aircraft](docs/full_plot.png)
 
 
 ## Context
@@ -74,9 +74,9 @@ Chosen because it has a known response for comparison:
 | 8×40 | 640 | 0.4022 | 4.609 | 0.00653 | 0.985 | -0.5066 | 24.5 |
 | 8×60 | 960 | 0.4012 | 4.597 | 0.00653 | 0.981 | -0.5066 | 36.7 |
 
-![CL convergence](docs\conv_cl.png)
+![CL convergence](docs/conv_cl.png)
 
-![Span efficiency](docs\conv_e.png)
+![Span efficiency](docs/conv_e.png)
 
 
 ### Full aircraft
@@ -103,7 +103,7 @@ TODO: add figure of aircraft
 | 252 | 1026 | 0.4148 | 0.2003 | 0.00732 | 41.1 |
 | 572 | 1506 | 0.4147 | 0.1986 | 0.00732 | 91.8 |
 
-![Neutral point](docs\conv_np.png)
+![Neutral point](docs/conv_np.png)
 
 **The neutral point remains governed by the tail, not the wing**
 - Quadrupling the wing panels moves $x_{np}$ by 0.0012 m;
@@ -222,7 +222,7 @@ Same case with analytical reference from the convergence study, matched mesh:
 With the same mesh and the same reference point, the two codes practically coincide,
 differing only in the 5th/6th decimal place.
 
-![CL, CD_i and Cm vs alpha, full aircraft](docs\asb_full_alpha.png)
+![CL, CD_i and Cm vs alpha, full aircraft](docs/asb_full_alpha.png)
 
 #### Joint convergence
 
@@ -236,13 +236,13 @@ Refining both codes together, same uniform spacing, $\alpha=5°$:
 | 128 | 0.4001 | 0.4001 | 1.3e-05 |
 | 256 | 0.3996 | 0.3996 | 1.2e-05 |
 
-![Joint convergence](docs\asb_convergence.png)
+![Joint convergence](docs/asb_convergence.png)
 
 ### Full aircraft
 
 Wing (2 segments) + winglets + horizontal and vertical tail, converted surface by surface.
 
-![The two geometries side by side, same camera](docs\asb_geometry_compare.png)
+![The two geometries side by side, same camera](docs/asb_geometry_compare.png)
 
 
 | quantity | main.py | AeroSandbox | relative difference |
@@ -270,7 +270,7 @@ winglets:
 | +2° | -0.0109 | -0.0105 | -0.0049 | -0.0049 | +0.0021 | +0.0017 |
 | +5° | -0.0270 | -0.0261 | -0.0123 | -0.0122 | +0.0052 | +0.0041 |
 
-![Lateral coupling](docs\asb_lateral.png)
+![Lateral coupling](docs/asb_lateral.png)
 
 $C_Y$ and $C_l$ track closely ($C_l$ practically overlapping).
 
