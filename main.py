@@ -5,6 +5,47 @@ import matplotlib
 from matplotlib import pyplot as plt
 matplotlib.use('TkAgg')
 
+
+def _style_dark(fig, axes):
+    """Classic XFOIL look (black background, white lines/text), matching the
+    polar and Cp plots in xfoil-python's xfoil/plot.py."""
+    fig.patch.set_facecolor('black')
+    for ax in axes:
+        ax.set_facecolor('black')
+        for spine in getattr(ax, 'spines', {}).values():
+            spine.set_color('white')
+        ax.tick_params(colors='white')
+        ax.xaxis.label.set_color('white')
+        ax.yaxis.label.set_color('white')
+        if hasattr(ax, 'zaxis'):
+            ax.zaxis.label.set_color('white')
+        ax.grid(True, linewidth=0.3, alpha=0.3, color='white')
+
+    # TkAgg's navigation toolbar defaults to a light theme; darken it to match
+    toolbar = getattr(getattr(fig.canvas, 'manager', None), 'toolbar', None)
+    if toolbar is not None:
+        bg, fg = '#1e1e1e', 'white'
+
+        def _paint(widget):
+            for key, value in (('background', bg), ('foreground', fg),
+                                ('activebackground', bg), ('activeforeground', fg),
+                                ('highlightbackground', bg)):
+                try:
+                    widget.configure(**{key: value})
+                except Exception:
+                    pass
+            for child in widget.winfo_children():
+                _paint(child)
+
+        _paint(toolbar)
+        # buttons cache a black-icon and a foreground-tinted icon at creation
+        # time; re-running this picks the tinted (now white) one since the
+        # button background is dark
+        for button in getattr(toolbar, '_buttons', {}).values():
+            if getattr(button, '_image_file', None) is not None:
+                toolbar._set_image_for_button(button)
+
+
 class Surface():
     """
     One lifting surface, built as a chain of trapezoidal segments.
@@ -19,8 +60,9 @@ class Surface():
     discretization  per segment (n, m): n nodes along the chord, m along the span. n must be the same in every segment
     symmetry        mirror about y=0; requires the root to sit on that plane
     control_surfaces  list of dicts: name, hinge (x/c from the LE), span (pair of semi-span fractions), mode ('symmetric'/'antisymmetric'), gain (optional multiplier)
+    airfoils        NACA 4-digit code at each breakpoint, same length as chord; camber (not thickness) tilts each panel's normal. None = flat plate
     """
-    def __init__(self, span, chord, sweep, dihedral, position, discretization, symmetry, control_surfaces=None):
+    def __init__(self, span, chord, sweep, dihedral, position, discretization, symmetry, control_surfaces=None, airfoils=None):
         self.span = span
         self.chord = chord
         self.sweep = sweep
@@ -29,6 +71,7 @@ class Surface():
         self.discretization = discretization
         self.symmetry = symmetry
         self.control_surfaces = control_surfaces if control_surfaces is not None else []
+        self.airfoils = airfoils if airfoils is not None else ['0000']*len(chord)
         self.S = 0.0
         self.MAC = 0.0
         self.b = 0.0
@@ -40,10 +83,6 @@ class Surface():
         self.vortex_b = []
     
     def transform(self, x, y, span, chord_root, chord_tip, sweep, dihedral, root):
-        # (x, y) are parametric: x = 0 at the LE, 1 at the TE; y = 0 at the segment
-        # root, 1 at its tip. `root` carries the LE reference where the previous
-        # segment stopped, so segments stay attached instead of each restarting.
-        # Swept aft is -x and tip-up is -z in these axes, hence the minus signs.
         x_root, y_root, z_root = root
         x_tip = x_root - span * np.tan(np.deg2rad(sweep))
         y_tip = y_root + span * np.cos(np.deg2rad(dihedral))
@@ -121,9 +160,26 @@ class Surface():
         normal = np.cross(diag1, diag2)
         dS =  np.linalg.norm(normal, axis = -1, keepdims = True)
         return normal / dS, 0.5*dS
+
+    def getCamberSlope(self, xc, M, P):
+        # NACA 4-digit mean camber line slope dz/d(x/c): one row per chordwise
+        # panel (xc), one column per spanwise panel (M, P already blended
+        # between root and tip airfoil). M=0 (symmetric section) is flat
+        # regardless of P -- dodges the P=0 divide of the true-symmetric case.
+        x, m, p = xc[:,None], M[None,:], P[None,:]
+        p_safe = np.where(p == 0.0, 1.0, p)
+        q_safe = np.where(p == 1.0, 1.0, 1.0 - p)
+        before = (2*m/p_safe**2) * (p - x)
+        after  = (2*m/q_safe**2) * (p - x)
+        return np.where(m == 0.0, 0.0, np.where(x < p, before, after))
     
     def generateMesh(self):
+        # NACA code -> (M, P) as fractions, one pair per breakpoint (same length as chord)
+        M_all = np.array([int(str(a).zfill(4)[0]) for a in self.airfoils]) / 100.0
+        P_all = np.array([int(str(a).zfill(4)[1]) for a in self.airfoils]) / 10.0
+
         X_segments, Y_segments, Z_segments , station_segments= [], [], [], []
+        M_segments, P_segments = [], []
         root = (0.0, self.span[0], 0.0)
         for i, (span_root, span_tip, chord_root, chord_tip, sweep, dihedral, (n,m)) in enumerate(zip(self.span[:-1], self.span[1:], self.chord[:-1], self.chord[1:], self.sweep, self.dihedral, self.discretization)):
             span_nodes = np.linspace(0.0, 1.0, m)
@@ -136,14 +192,23 @@ class Surface():
             Y_segments.append(Y[:, shared])
             Z_segments.append(Z[:, shared])
             station_segments.append(np.linspace(span_root, span_tip, m)[shared])
+            # airfoil blends linearly root->tip, same as chord itself
+            M_segments.append((M_all[i] + span_nodes*(M_all[i+1] - M_all[i]))[shared])
+            P_segments.append((P_all[i] + span_nodes*(P_all[i+1] - P_all[i]))[shared])
 
         X = np.concatenate(X_segments, axis=1)
         Y = np.concatenate(Y_segments, axis=1)
         Z = np.concatenate(Z_segments, axis=1)
         s = np.concatenate(station_segments)
+        M = np.concatenate(M_segments)
+        P = np.concatenate(P_segments)
 
         if self.symmetry:
             X, Y, Z, s = self.mirror(X, Y, Z, s)
+            # M, P mirror like X/Z (camber doesn't flip sign with Y), not like s
+            keep = slice(None, -1)
+            M = np.concat([M[::-1][keep], M])
+            P = np.concat([P[::-1][keep], P])
 
         self.nodes = np.stack((X, Y, Z), axis=-1)
         self.aero_centers = self.getAeroCenter(self.nodes)
@@ -156,6 +221,19 @@ class Surface():
 
         dl = self.vortex_b - self.vortex_a
         self.hinge_axis = dl / np.linalg.norm(dl, axis=-1, keepdims=True)
+
+        # camber tilts the normal at each panel's own control point (3/4 of ITS
+        # local chord, where flow tangency is enforced), same rotation Rodrigues
+        # formula as a control deflection -- camber is just a baked-in one
+        n_shared = self.discretization[0][0]
+        chord_nodes = np.linspace(0.0, 1.0, n_shared)
+        xc_panel = chord_nodes[:-1] + 0.75*(chord_nodes[1:] - chord_nodes[:-1])
+        M_panel = 0.5*(M[:-1] + M[1:])
+        P_panel = 0.5*(P[:-1] + P[1:])
+        theta = -np.arctan(self.getCamberSlope(xc_panel, M_panel, P_panel))   # sign checked against NACA 2412's known CL(a=0)
+        n, h = self.normals, self.hinge_axis
+        self.normals = n*np.cos(theta)[...,None] + np.cross(h, n)*np.sin(theta)[...,None]
+
         self.control_gains = self.getControlGains()
 
     def plot(self, fig_ax=None, plot_aero = False, plot_collocation = False, plot_control_surfaces = False, control_colors = None):
@@ -276,27 +354,23 @@ class Aircraft():
                             top=1
                             )
 
-        ax.plot(*self.CG, marker='x', color='k', markersize=10, markeredgewidth=2, linestyle='none', label='CG')
+        ax.plot(*self.CG, marker='x', color='white', markersize=10, markeredgewidth=2, linestyle='none', label='CG')
         ax.plot(*self.neutralPoint(), marker='^', color='tab:red', markersize=9, linestyle='none', label='NP')
-                            
+
         for surface in self.surfaces:
             fig, ax = surface.plot(fig_ax = (fig, ax), **kwargs)
-            
+
         ax.set_box_aspect([
                             np.ptp(self.nodes[:,0]),
                             np.ptp(self.nodes[:,1]),
                             np.ptp(self.nodes[:,2])
                             ])
 
-        # stability axes put z+ down, and matplotlib always draws z+ up, so the default
-        # camera shows the aircraft belly-up. roll=180 turns the camera over instead of
-        # flipping an axis: inverting z would mirror the scene and swap left/right wing,
-        # which would misread any antisymmetric deflection. elev is arctan(1/sqrt(2)),
-        # the isometric angle; with azim=60 the camera sits ahead, right and above.
         ax.set_proj_type('ortho')
         ax.view_init(elev=-35.264, azim=60, roll=180)
-                            
-        ax.legend()
+
+        _style_dark(fig, (ax,))
+        ax.legend(fontsize=8, labelcolor='white', facecolor='black', edgecolor='white')
         ax.set_axis_off()
         plt.show()
 
@@ -366,40 +440,9 @@ class Aircraft():
         Cl, Cm, Cn = T_a @ (M_bar * np.array([-1/span_ref, 1/chord_ref, -1/span_ref]))
 
         return CD_i, CY, CL, Cl, Cm, Cn
- 
-    def simulate(self, V_inf, alpha, beta, omega=np.array([0.0, 0.0, 0.0]), deltas=None):
-        """
-        One flight condition -> (CD_i, CY, CL, Cl, Cm, Cn) in stability axes.
-        alpha, beta and deltas in degrees;
-        """
-        # freestream direction: the aircraft flies towards +x, so the oncoming flow
-        # points along -x, tilted by alpha in the x-z plane and by beta in x-y
-        V_bar = np.array([
-            -np.cos(np.deg2rad(alpha))*np.cos(np.deg2rad(beta)),
-            -np.sin(np.deg2rad(beta)),
-            -np.sin(np.deg2rad(alpha))*np.cos(np.deg2rad(beta))])
-
-        omega_bar = omega/V_inf
-
-        # body -> stability axes: a rotation by alpha about y, so the coefficients come
-        # out along lift/side-force/drag rather than along the body axes
-        T_a = np.array([
-            [-np.cos(np.deg2rad(alpha)), 0.0, -np.sin(np.deg2rad(alpha))],
-            [                       0.0, 1.0,                       0.0],
-            [ np.sin(np.deg2rad(alpha)), 0.0, -np.cos(np.deg2rad(alpha))]
-        ])
-
-        normals     = self.deflect(deltas)
-
-        AIC         = self.computeAIC(normals)
-
-        circulation = self.solveSystem(AIC, normals, V_bar, omega_bar)
-
-        return self.computeCoefficients(circulation, V_bar, omega_bar, T_a)
       
     def coefficientsAt(self, alpha, beta, deltas, V_inf=1.0, omega=np.array([0.0, 0.0, 0.0])):
         """
-        The same pipeline as simulate().
         written as a pure function of the deflection so jax.jacfwd can differentiate it. 
         """
         V_bar = np.array([
@@ -448,7 +491,111 @@ class Aircraft():
         d = self.stabilityDerivatives(alpha, beta, deltas)
         x_np = self.CG[0] + reference.MAC * d[4] / d[2]
         return np.array([x_np, self.CG[1], self.CG[2]])
-    
+
+    def computeLoads(self, alpha, beta, deltas=None, omega=None, V_inf=1.0, rho=1.225, ref_fraction=0.25):
+        """Shear (V), bending (M) and torsion (T) along each surface's span, tip to root, one flight condition."""
+        deltas = np.zeros(len(self.control_names)) if deltas is None else deltas
+        omega_bar = (np.array([0.0, 0.0, 0.0]) if omega is None else omega) / V_inf
+
+        V_bar = np.array([
+            -np.cos(np.deg2rad(alpha)) * np.cos(np.deg2rad(beta)),
+            -np.sin(np.deg2rad(beta)),
+            -np.sin(np.deg2rad(alpha)) * np.cos(np.deg2rad(beta))])
+
+        normals = self.deflect(deltas)
+        AIC = self.computeAIC(normals)
+        circulation = self.solveSystem(AIC, normals, V_bar, omega_bar)
+
+        reference = max(self.surfaces, key=lambda surf: surf.S)
+        S_ref = reference.S
+        q_S_ref = 0.5 * rho * V_inf**2 * S_ref
+
+        induced = np.sum(self.influence_aero * circulation[None, :, None], axis=1)
+        V_bar_i = induced - V_bar - np.cross(omega_bar[None, :], self.aero_centers)
+        F_panel = q_S_ref * (2 / S_ref) * np.cross(V_bar_i, self.vortex_b - self.vortex_a) * circulation[:, None]
+
+        results = {}
+        start = 0
+        for i, surface in enumerate(self.surfaces):
+            n_chord, n_span = surface.collocation.shape[0], surface.collocation.shape[1]
+            n = n_chord * n_span
+            F = F_panel[start:start + n].reshape(n_chord, n_span, 3)
+            start += n
+
+            LE, TE = surface.nodes[0, :, :], surface.nodes[-1, :, :]
+            ref_line = LE + ref_fraction * (TE - LE)
+            ref_x = (0.5 * (ref_line[:-1] + ref_line[1:]))[:, 0]
+            aero_x = surface.aero_centers[..., 0]
+            station = surface.span_station * surface.span[-1]
+
+            Fz = F[:, :, 2].sum(axis=0)
+            Tl = (F[:, :, 2] * (aero_x - ref_x[None, :])).sum(axis=0)
+
+            sides = [station >= 0, station < 0] if surface.symmetry else [np.ones_like(station, dtype=bool)]
+            surface_results = []
+            for mask in sides:
+                s, fz, t = station[mask], Fz[mask], Tl[mask]
+                order = np.argsort(-np.abs(s))
+                s, fz, t = s[order], fz[order], t[order]
+                Vc = np.cumsum(fz)
+                Tc = np.cumsum(t)
+                Mc = np.cumsum(fz * np.abs(s)) - np.abs(s) * Vc
+                surface_results.append({"station": s, "V": Vc, "M": Mc, "T": Tc})
+            results[i] = surface_results
+
+        return results
+
+    def plotLoads(self, results, names):
+        """One figure per surface: V, M and T on the same axes, zero aligned across all three scales."""
+        colors = ["tab:blue", "tab:orange", "tab:green"]
+        keys = ["V", "M", "T"]
+
+        for i, surface_results in results.items():
+            fig, host = plt.subplots(figsize=(7, 5))
+            fig.subplots_adjust(
+                    left=0.125,
+                    right=0.75,
+                    bottom=0.1,
+                    top=0.9
+                    )
+
+            twin1 = host.twinx()
+            twin2 = host.twinx()
+            twin2.spines["right"].set_position(("axes", 1.15))
+            axes = [host, twin1, twin2]
+            _style_dark(fig, axes)
+
+            for side in surface_results:
+                for ax, key, color in zip(axes, keys, colors):
+                    ax.plot(side["station"], side[key], color=color)
+
+            extents = []
+            for key in keys:
+                values = [v for side in surface_results for v in side[key]]
+                pos = max(0.0, max(values)) * 1.1
+                neg = max(0.0, -min(values)) * 1.1
+                extents.append((pos, neg))
+
+            two_sided = [n / (p + n) for p, n in extents if p > 0 and n > 0]
+            f = sum(two_sided) / len(two_sided) if two_sided else 0.5
+            r = f / (1 - f)
+            for ax, (pos, neg) in zip(axes, extents):
+                p = max(pos, neg / r)
+                n = r * p
+                ax.set_ylim(-n, p)
+
+            host.set_xlabel("station [m]")
+            host.set_ylabel("V [N]", color=colors[0])
+            twin1.set_ylabel("M [N.m]", color=colors[1])
+            twin2.set_ylabel("T [N.m]", color=colors[2])
+            host.tick_params(axis="y", colors=colors[0])
+            twin1.tick_params(axis="y", colors=colors[1])
+            twin2.tick_params(axis="y", colors=colors[2])
+            host.axhline(0, color="0.7", linewidth=0.8)
+            host.set_title(f"Loads {names[i]}", color='white')
+            host.grid(True)
+            
+        plt.show()
     
 if __name__ == "__main__":
     
@@ -459,6 +606,7 @@ if __name__ == "__main__":
                    position = [0.0, 0.0, 0.0],
                    discretization = [(6, 11), (6, 31)],
                    symmetry = True, 
+                   airfoils=['0012','0012','0012'],
                    control_surfaces = [dict(name='aileron', 
                                             hinge=0.75, 
                                             span=(0.55, 0.95), 
@@ -474,7 +622,8 @@ if __name__ == "__main__":
                             dihedral=[90.0],
                             position=[-3.5*np.sin(np.deg2rad(10)),  3.4983, -0.1047],
                             discretization=[(5, 10)],
-                            symmetry=False)
+                            symmetry=False,
+                            airfoils=['0012','0012'])
 
     winglet_left = Surface(span=[0.0, 0.5],
                            chord=[0.5, 0.2],
@@ -482,7 +631,8 @@ if __name__ == "__main__":
                            dihedral=[90.0],
                            position=[-3.5*np.sin(np.deg2rad(10)), -3.4983, -0.1047],
                            discretization=[(5, 10)],
-                           symmetry=False)
+                           symmetry=False,
+                           airfoils=['0012','0012'])
 
     hTail = Surface(span= [0.0, 1.5], 
                     chord = [0.75, 0.4], 
@@ -491,6 +641,7 @@ if __name__ == "__main__":
                     position = [-3.0, 0.0, -1.0],
                     discretization = [(10, 25)],
                     symmetry = True,
+                    airfoils=['0012','0012'],
                     control_surfaces = [dict(name='elevator',
                                             hinge=0.75, 
                                             span=(0.15, 0.95), 
@@ -503,6 +654,7 @@ if __name__ == "__main__":
                     position = [-3.0, 0.0, -1.0],
                     discretization = [(10, 25)],
                     symmetry = False,
+                    airfoils=['0012','0012'],
                     control_surfaces = [dict(name='rudder',
                                             hinge=0.50, 
                                             span=(0.05, 0.95), 
@@ -515,20 +667,25 @@ if __name__ == "__main__":
     header = f"\n{'':>{row_label_width}} " + " ".join(f"{name:>{width}}" for name in labels)
 
     deltas = np.zeros(len(airplane.control_names))
+    # Print polar
+    print(header)
     for a in range(-10, 11, 1):
-        print(header)
-        # deltas = deltas.at[i].set(float(a))
-
         c  = airplane.coefficientsAt(alpha=float(a), beta=0.0, deltas=deltas)
-        da = airplane.stabilityDerivatives(alpha=float(a), beta=0.0, deltas=deltas)
-        dd = airplane.controlDerivatives(alpha=float(a), beta=0.0, deltas=deltas)
-
         print(f"{f'AoA:{a:.1f}':>{row_label_width}} " + " ".join(f"{v:{width}.4f}" for v in c))
-        print(f"{'d/dalpha':>{row_label_width}} " + " ".join(f"{v:{width}.4f}" for v in da))
-        for j, name in enumerate(airplane.control_names):
-            print(f"{'d/d'+name:>{row_label_width}} " + " ".join(f"{v:{width}.4f}" for v in dd[:, j]))
 
+    # Print Derivatives
+    da = airplane.stabilityDerivatives(alpha=float(a), beta=0.0, deltas=deltas)
+    dd = airplane.controlDerivatives(alpha=float(a), beta=0.0, deltas=deltas)
 
+    print(f"{'d/dalpha':>{row_label_width}} " + " ".join(f"{v:{width}.4f}" for v in da))
+    for j, name in enumerate(airplane.control_names):
+        print(f"{'d/d'+name:>{row_label_width}} " + " ".join(f"{v:{width}.4f}" for v in dd[:, j]))
+
+    # Plot aircraft
     airplane.plot(plot_control_surfaces = True)
-    
-    
+
+    # Plot Loads
+    loads = airplane.computeLoads(alpha=1.0, beta=0.0, deltas=[0.0, 0.0, 1.0, 0.0])
+
+    airplane.plotLoads(loads, names=["wing", "winglet_right", "winglet_left", "hTail", "vTail"])
+
