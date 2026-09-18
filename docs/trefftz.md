@@ -83,7 +83,7 @@ para `CD_i`, nunca um substituto.
 
 ## 4 · O campo distante resolve a diferença com o AeroSandbox?
 
-`aerosandbox_compare.md` registra `CD_i` 5,2% abaixo do AeroSandbox na aeronave completa —
+`aerosandbox_compare.md` registra `CD_i` 5,0% abaixo do AeroSandbox na aeronave completa —
 a maior discrepância daquele estudo. Se o campo próximo fosse o culpado, o campo distante
 deveria encostar mais perto. Na mesma aeronave, α = 5°:
 

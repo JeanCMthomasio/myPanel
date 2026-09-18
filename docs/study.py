@@ -13,7 +13,7 @@ def rect(n, m):
     w = Surface(span=[0.,4.], chord=[1.,1.], sweep=[0.], dihedral=[0.],
                 position=[0.,0.,0.], discretization=[(n,m)], symmetry=True)
     ac = Aircraft(CG=np.array([0.,0.,0.]), surfaces=[w])
-    CD, CY, CL, Cl, Cm, Cn = [float(v) for v in ac.simulate(1.0, ALPHA, 0.0)]
+    CD, CY, CL, Cl, Cm, Cn = [float(v) for v in ac.coefficientsAt(ALPHA, 0.0, None, V_inf=1.0)]
     return dict(N=int(ac.collocation.shape[0]), nc=n-1, ns=m-1, CL=CL,
                 CLa=CL/onp.deg2rad(ALPHA), CD=CD, e=CL**2/(onp.pi*AR*CD),
                 xcp=-Cm*float(w.MAC)/CL, cond=float(onp.linalg.cond(onp.asarray(ac.computeAIC(ac.deflect())))))
@@ -31,9 +31,9 @@ def plane(nw, mw, nt, mt):
                 discretization=[(nt,mt)], symmetry=False)])
 
 def neutral(ac, which):
-    c0 = [float(v) for v in ac.simulate(1.0, 0.0, 0.0)]
+    c0 = [float(v) for v in ac.coefficientsAt(0.0, 0.0, None, V_inf=1.0)]
     cond0 = float(onp.linalg.cond(onp.asarray(ac.computeAIC(ac.deflect()))))
-    c5 = [float(v) for v in ac.simulate(1.0, 5.0, 0.0)]
+    c5 = [float(v) for v in ac.coefficientsAt(5.0, 0.0, None, V_inf=1.0)]
     cond5 = float(onp.linalg.cond(onp.asarray(ac.computeAIC(ac.deflect()))))
     mac = float(ac.surfaces[0].MAC)
     npan = int(onp.prod(onp.asarray(ac.surfaces[which].collocation).shape[:2]))

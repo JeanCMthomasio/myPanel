@@ -2,5 +2,9 @@ jax>=0.6.2
 matplotlib>=3.10.5
 numpy>=2.2.6
 
+# Sectional data for viscous runs. From GitHub, not PyPI: the PyPI sdist of 1.1.1 no
+# longer builds against modern setuptools. Needs gfortran, cmake, make.
+xfoil @ git+https://github.com/DARcorporation/xfoil-python.git@1.1.1
+
 # only needed for the AeroSandbox comparison scripts in docs/
 aerosandbox>=4.2.8

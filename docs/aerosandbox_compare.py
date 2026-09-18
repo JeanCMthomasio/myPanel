@@ -65,7 +65,7 @@ def toAsbWing(s, name):
 
 
 def mine(ac, alpha, beta=0.0):
-    c = ac.simulate(V_inf=1.0, alpha=alpha, beta=beta)
+    c = ac.coefficientsAt(alpha=alpha, beta=beta, deltas=None, V_inf=1.0)
     return dict(CD_i=float(c[0]), CY=float(c[1]), CL=float(c[2]),
                 Cl=float(c[3]), Cm=float(c[4]), Cn=float(c[5]))
 

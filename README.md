@@ -8,11 +8,38 @@ A study focused on implementing a clear and instructive program to compute VLM f
 
 The current implementation is based on the book Flight Vehicle Aerodynamics, by Mark Drela, on section 6.5.
 
-The code consists of a potential method for solving 3D flows. It can be very useful for configuration analysis, load estimation, trim conditions, stability and control derivatives.
+The code consists of a potential method for solving 3D flows, optionally coupled to 2D viscous section data from XFOIL. It can be very useful for configuration analysis, load estimation, trim conditions, stability and control derivatives.
 
-The geometry of the configuration is highly simplified, any volumes of the geometry and its effects are ignored. The only geometry considerations taken into account are deflections and surface camber, and this is achieved by the rotation of the surface normals.
+The geometry of the configuration is highly simplified, any volumes of the geometry and its effects are ignored. The lattice itself is a flat plate: the only geometric effect it carries is control-surface deflection, achieved by the rotation of the surface normals. Section properties — camber, thickness, profile drag — enter only through the viscous coupling described below, which is why the lattice needs no camber model of its own.
 
 The current implementation uses the JAX library as its numerical engine. This choice was made to make use of Automatic Differentiation, which could be useful in trade and optimization studies and is used for calculation of control derivatives. JAX also allows the user to specify which hardware the program runs on, either the CPU, the GPU, or even the TPU if available, and offers a series of function transformations that are useful for parallel computation and vectorization.
+
+## Installing
+
+The inviscid solver needs only three packages:
+
+```bash
+pip install jax numpy matplotlib
+```
+
+The viscous coupling adds XFOIL, which ships as a Fortran extension and is compiled at
+install time, so it needs a toolchain:
+
+```bash
+sudo apt install gfortran cmake make        # Debian/Ubuntu
+pip install -r requirements.txt
+```
+
+`requirements.txt` takes XFOIL from the upstream GitHub tag, not from PyPI: the PyPI sdist
+of 1.1.1 no longer builds against modern setuptools.
+
+
+### A note on non-converged points
+
+`XFoil.aseq` reports a non-converged angle by writing `NaN` into the **angle** array, not
+only into the coefficients. `generatePolars` therefore rebuilds the angle sequence itself
+(`alphaSequence`) rather than trusting what comes back, and `trimPolar` bridges short gaps
+before interpolating.
 
 ## Theory
 
@@ -35,6 +62,72 @@ The Aircraft class is responsible for aggregating all the surfaces into a single
 From these the circulation at each panel is computed, along with the aerodynamic forces and moments. From this the coefficients are easily computable with a nondimensionalization and a rotation to the wind axes. Using the facilities of automatic differentiation from JAX it is possible to compute the stability derivatives and the control derivatives for each coefficient.
 
 An easy result from this is the possibility of computing the derivative of pitch ($C_m$) with respect to AoA ($\alpha$). With it the Neutral Point is easily found at $dC_m/d\alpha = 0$, and the longitudinal stability can be inferred by comparing the position of this to the center of gravity. These points are automatically plotted into the aircraft's plot routine.
+
+## Viscous coupling
+
+The lattice alone is linear and inviscid: no stall, no profile drag, and $C_L(\alpha)$ is linear. Calling `coefficientsAt(..., viscous=True)` couples each spanwise
+strip to 2D XFOIL data using the *alpha method* of Parenteau, Laurendeau and Carrier
+(*Combined High-speed and High-lift Wing Aerodynamic Optimization Using a Coupled VLM-2.5D
+RANS Approach*, §2.3).
+
+Each strip carries one unknown, an incidence shift $\Delta\alpha$. The lattice is solved
+with local incidence $\alpha - \Delta\alpha$, which gives the strip's inviscid lift
+$C_{l_{inv}} = 2\pi(\alpha - \Delta\alpha - \alpha_i)$. Recovering the effective angle
+$\alpha_e = C_{l_{inv}}/2\pi + \Delta\alpha = \alpha - \alpha_i$, the polar is read at that
+angle and the shift is updated by
+
+$$\Delta\alpha \leftarrow \Delta\alpha - \frac{C_{l_{visc}}(\alpha_e) - C_{l_{inv}}}{2\pi}$$
+
+At the fixed point each strip produces exactly the 2D viscous lift at its downwash-corrected
+angle, with the lattice supplying the induced angle $\alpha_i$. The $2\pi$ divisor is the
+inversion done analytically .
+
+$\Delta\alpha$ is applied as a rotation of the panel normals about the bound vortex, the same
+mechanism a control deflection uses, so the two compose additively.
+
+### Sweep
+
+XFOIL data is 2D and unswept. Simple sweep theory (Küchemann) converts it to the swept
+section, reading the polar in the plane normal to the quarter-chord line:
+
+$$\alpha_n = \frac{\alpha_e}{\cos\varphi}, \qquad C_l = \cos^2\!\varphi \; C_{l_{2D}}(\alpha_n)$$
+
+which reproduces the classic swept lift-curve slope $2\pi\cos\varphi$. $\varphi$ is measured
+from the mesh, between adjacent spanwise node columns of the quarter-chord line, and **not**
+from the `sweep` argument — that one sweeps the three-quarter-chord reference line, so with
+taper the two differ substantially. For the demo wing in `main.py`, `sweep=10°` corresponds
+to a quarter-chord sweep of $28.9°$ inboard and $15.5°$ outboard.
+
+Profile drag is read at $\alpha_n$ but not scaled: skin friction, dominant at attached
+subsonic conditions, follows the full velocity rather than its normal component.
+
+### Polars
+
+Polars are tabulated once per distinct (airfoil, $Re$) pair and evaluated by interpolation —
+XFOIL is never called inside the iteration. A whole polar costs about the same as 25 scattered
+single-point calls, and interpolation keeps the coupling differentiable, so `jax.jacfwd` still
+traces it. `Re` scales per section with the local chord relative to the MAC, and sections
+between two breakpoints blend linearly between their polars, exactly as the chord does.
+
+A surface is coupled if it carries a real airfoil. The default `'0000'` is a zero-thickness
+plate, which XFOIL rejects, so those surfaces stay inviscid. Polars are built on the first
+viscous call and rebuilt only if `M` or `Re` change.
+
+### Loads
+
+At convergence the lattice already carries the section lift exactly, so only two things are
+added: the profile drag force along the local flow, and the section pitching couple. Both are
+summed into the force and moment before the rotation to stability axes, so $C_D$ totals
+induced plus profile automatically. Using the couple directly avoids the centre-of-pressure
+form $x_{cp} = C_m/C_l$, which is singular at zero lift.
+
+### What the coupling does not capture
+
+Sweep enters kinematically only — the viscous crossflow that reduces $C_{L_{max}}$ on swept
+wings, which the reference captures with 2.5D RANS, is absent, so $C_{L_{max}}$ is optimistic
+there. A deflected control still tilts the normals, but the polar is that of the clean
+section, making flapped sections first-order correct in $C_l$ and wrong in stall angle and
+$C_d$. The chordwise load distribution remains the flat-plate one.
 
 ## Tests
 
@@ -185,23 +278,20 @@ while the theory assumes infinite $AR$ (2D flow).
 
 ### AD × finite difference
 
-Instead of relying on a single $h$, I swept the step size: central finite difference in
-float32 trades truncation error (large $h$) for numerical cancellation (small $h$), so we
-expect a V-shaped pattern in the error value as $h$ decreases.
 
 The flap in this test is symmetric and $\alpha=\beta=0$. The relative error metric is
 restricted to $C_L$ and $C_m$.
 
-| $h$ (degrees) | maximum relative error ($C_L$, $C_m$) |
-|---|---|
-| 1.0000 | 1.02e-04 |
-| 0.1000 | 1.22e-06 |
-| 0.0100 | 8.12e-08 |
-| 0.0010 | 2.37e-07 |
-| 0.0001 | 2.11e-07 |
+| $h$ (degrees) | maximum relative error ($C_L$, $C_m$) | in float32 |
+|---|---|---|
+| 1.0000 | 1.02e-04 | 1.02e-04 |
+| 0.1000 | 1.02e-06 | 1.22e-06 |
+| 0.0100 | 1.02e-08 | 8.12e-08 |
+| 0.0010 | 1.02e-10 | 2.37e-07 |
+| 0.0001 | 1.02e-12 | 2.11e-07 |
 
-Floor around **8.1e-08** for $h \approx 0.01°$, rising at both extremes — the expected V.
-
+With the solver in float64 (`jax_enable_x64`) the decay is **monotone and exactly second
+order**: every 10× reduction in $h$ buys 100× less error, across eight orders of magnitude.
 ## Comparison with AeroSandbox's VLM
 
 Validation against `asb.VortexLatticeMethod` from
@@ -281,7 +371,9 @@ small (~0.004-0.005) and of the same sign and order of magnitude;
 
 The current state of the code does not take into account any body elements, and its tail refinement seems to have a severe impact on the prediction of the position of the neutral point of the aircraft.
 
-As the present code was designed with clarity in mind as a study for the Vortex Lattice Method, its computational performance is sub-optimal both in the sense of time and memory allocation. As such, this limits its application to MDO and optimization, which need to explore a large number of possibilities.
+As the present code was designed with clarity in mind as a study for the Vortex Lattice Method, its computational performance is sub-optimal both in the sense of time and memory allocation. As such, this limits its application to MDO and optimization, which need to explore a large number of possibilities. A viscous run compounds this: the coupling re-assembles the AIC and re-solves the linear system at every iteration, so one flight condition costs roughly twenty inviscid solves.
+
+The test results reported below were all produced on the inviscid path; the viscous coupling is verified separately, against synthetic polars with a known closed-form answer and against the 2D limit at high aspect ratio.
 
 ## Conclusions
 

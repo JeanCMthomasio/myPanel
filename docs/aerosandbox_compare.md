@@ -90,15 +90,18 @@ que o `VortexLatticeMethod` do AeroSandbox devolve (`front_left_vertices` etc.) 
 estabilidade antes de desenhar, senão os dois painéis ficariam em câmeras fisicamente
 inconsistentes mesmo compartilhando os mesmos limites de eixo.
 
+A coluna de diferença relativa usa o AeroSandbox como denominador, por ser a referência da
+comparação — é a mesma convenção do `trefftz.py`, que imprime o desvio do mesmo caso.
+
 | grandeza | main.py | AeroSandbox | diferença relativa |
 |---|---|---|---|
 | `CL` (α=5°) | 0,426036 | 0,426954 | 0,22% |
-| `CD_i` (α=5°) | 0,006926 | 0,007288 | 5,23% |
-| `Cm` (α=5°) | 0,321280 | 0,320494 | 0,24% |
+| `CD_i` (α=5°) | 0,006926 | 0,007288 | 4,97% |
+| `Cm` (α=5°) | 0,321280 | 0,320494 | 0,25% |
 
-`CL` e `Cm` concordam a **0,24%** ou melhor em toda a faixa de α (gráfico acima,
+`CL` e `Cm` concordam a **0,25%** ou melhor em toda a faixa de α (gráfico acima,
 painéis 1 e 3 — as curvas ficam praticamente sobrepostas). `CD_i` diverge um pouco mais
-(5,2% em α=5°) — esperado: arrasto induzido é a diferença entre dois números
+(5,0% em α=5°) — esperado: arrasto induzido é a diferença entre dois números
 grandes (a projeção da sustentação inclinada menos a sustentação em si), então amplifica
 qualquer detalhe fino de discretização que `CL` e `Cm` absorvem sem problema.
 

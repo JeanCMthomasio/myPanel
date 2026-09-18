@@ -28,7 +28,7 @@ def makeAircraft():
     return Aircraft(surfaces=[wing, hTail, vTail], CG=np.array([-1.,0.,0.]))
 
 ac = makeAircraft()
-old = [float(v) for v in ac.simulate(1.0, 5.0, 0.0)]
+old = [float(v) for v in ac.coefficientsAt(5.0, 0.0, None)]
 new = [float(v) for v in ac.coefficientsAt(5.0, 0.0, np.zeros(len(ac.control_names)))]
 R['regression'] = dict(names=['CD_i','CY','CL','Cl','Cm','Cn'], old=old, new=new,
                         max_abs_diff=max(abs(o-n) for o, n in zip(old, new)))
@@ -112,21 +112,17 @@ R['flap_effectiveness'] = dict(theory=float(thin_airfoil_ratio), hinge=hinge, co
 
 
 # --------------------------------------------------- 5. AD contra dif. central
-# Sweep h instead of trusting one value: float32 central differences trade
-# truncation error (large h) against cancellation error (small h), so the
-# relative error is expected to trace a V against h with a floor somewhere
-# around 1e-3, not vanish as h -> 0. A flat/decreasing error with no floor
-# would be the actual red flag (would mean the AD gradient itself is wrong
-# and just happens to agree with a biased finite difference at one h).
+# Sweep h instead of trusting one value: central differences trade truncation
+# error (large h) against cancellation (small h), tracing a V whose vertex sits
+# where they cross. In float64 that vertex falls outside this h range, so the
+# error should drop cleanly at second order -- 100x per decade of h.
 a = flapWing(9)
 J_ad = onp.asarray(a.controlDerivatives(0.0, 0.0, np.zeros(1)))[:, 0]   # (6,)
 
 # CD_i, CY, Cl, Cn are analytically zero here (symmetric flap, alpha=beta=0 on
-# a planar wing -- same even/odd argument as the aileron check, mode-reversed:
-# a SYMMETRIC-mode control leaves CY/Cl/Cn at zero to leading order). J_ad
-# confirms it (~1e-11, float32 noise). A relative-error metric against that
-# noise floor is measuring roundoff, not the AD -- restrict the check to the
-# components with a real, nonzero derivative (CL, Cm).
+# a planar wing -- same even/odd argument as the aileron check, mode-reversed).
+# Dividing that roundoff by itself would measure precision, not the AD, so the
+# check is restricted to the components with a real derivative (CL, Cm).
 meaningful = onp.abs(J_ad) > 1e-4
 
 sweep = []
@@ -142,7 +138,7 @@ R['ad_vs_fd'] = dict(names=['CD_i','CY','CL','Cl','Cm','Cn'], ad=J_ad.tolist(), 
 
 
 json.dump(R, open(os.path.join(HERE, 'controles.json'), 'w'), indent=1)
-print("1. regressao       max|dif| =", R['regression']['max_abs_diff'], '(simulate(deltas=None) vs coefficientsAt(zeros))')
+print("1. regressao       max|dif| =", R['regression']['max_abs_diff'], '(coefficientsAt(deltas=None) vs coefficientsAt(zeros))')
 print("2. aileron  5 deg  ", dict(zip(R['aileron']['names'], [round(v,6) for v in R['aileron']['values']])))
 print("   par (CL,CD_i,Cm ~ 0):", {k: round(dict(zip(R['aileron']['names'],R['aileron']['values']))[k],6) for k in R['aileron']['even']})
 print("   impar, livre (CY,Cl,Cn):", {k: round(dict(zip(R['aileron']['names'],R['aileron']['values']))[k],6) for k in R['aileron']['odd']})

@@ -82,7 +82,7 @@ def bothMethods(ac, S_ref, alpha, beta=0.0):
     V_bar, omega_bar, T_a = frame(alpha, beta)
     normals = ac.deflect(None)
     circ = ac.solveSystem(ac.computeAIC(normals), normals, V_bar, omega_bar)
-    near = [float(v) for v in ac.computeCoefficients(circ, V_bar, omega_bar, T_a)]
+    near = [float(v) for v in ac.computeInviscousCoefficients(circ, alpha, V_bar, omega_bar)]
     CD_t, CY_t, CL_t = trefftzLoads(ac, circ, S_ref)
     return dict(CD_near=near[0], CY_near=near[1], CL_near=near[2], Cm_near=near[4],
                 CD_tref=CD_t,    CY_tref=CY_t,    CL_tref=CL_t)
