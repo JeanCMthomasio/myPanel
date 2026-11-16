@@ -33,12 +33,16 @@ pip install -r requirements.txt
 `requirements.txt` takes XFOIL from the upstream GitHub tag, not from PyPI: the PyPI sdist
 of 1.1.1 no longer builds against modern setuptools.
 
+`Aircraft(..., polar_source='neuralfoil')` swaps XFOIL for NeuralFoil, a neural network trained
+on XFOIL data. It needs no compiler and builds the polars far faster, at the cost of ignoring
+`M` and of drifting from XFOIL near stall. The default remains `'xfoil'`.
+
 
 ### A note on non-converged points
 
 `XFoil.aseq` reports a non-converged angle by writing `NaN` into the **angle** array, not
 only into the coefficients. `generatePolars` therefore rebuilds the angle sequence itself
-(`alphaSequence`) rather than trusting what comes back, and `trimPolar` bridges short gaps
+(`alphaSequence`) rather than trusting what comes back, and `cropPolar` bridges short gaps
 before interpolating.
 
 ## Theory
@@ -85,6 +89,26 @@ inversion done analytically .
 $\Delta\alpha$ is applied as a rotation of the panel normals about the bound vortex, the same
 mechanism a control deflection uses, so the two compose additively.
 
+### Solving the iteration
+
+A rotated normal is $\cos\theta\,\hat n + \sin\theta\,(\hat h\times\hat n)$, so the AIC splits row by
+row into two fixed matrices, $\mathrm{diag}(\cos\theta)A_0 + \mathrm{diag}(\sin\theta)A_1$, which
+depend on the mesh and the deflections but not on $\alpha$ or $\beta$. $A_0$ is factorized once and
+reused across a sweep; each pass only corrects the circulation with
+$\Gamma \leftarrow \Gamma + A_0^{-1}(b - A\,\Gamma)$, at $O(N^2)$ cost. The residual vanishes at the
+fixed point, so the converged answer is that of the full system.
+
+The iteration stops once both residuals fall below `tol`, up to `n_iter` passes, and warns if it
+never does. Attached flow takes about 10 passes; near stall the local lift slope turns negative and
+convergence slows to hundreds. A limit cycle can appear on a steep section of a polar, in which case
+`relax` below 1 restores convergence. The stopping test makes the solver forward-mode only:
+`jax.jacfwd` works, `jax.jacrev` does not.
+
+`jax.jacfwd` differentiates the iterations, not the fixed point, but the iteration is close to
+Newton (the section lift slope is near $2\pi$), so the tangent converges with the solution: once
+the point converges, the derivatives match central finite differences of the converged answer to
+about $10^{-10}$ relative in $\alpha$, $\beta$ and every control.
+
 ### Sweep
 
 XFOIL data is 2D and unswept. Simple sweep theory (Küchemann) converts it to the swept
@@ -111,7 +135,7 @@ between two breakpoints blend linearly between their polars, exactly as the chor
 
 A surface is coupled if it carries a real airfoil. The default `'0000'` is a zero-thickness
 plate, which XFOIL rejects, so those surfaces stay inviscid. Polars are built on the first
-viscous call and rebuilt only if `M` or `Re` change.
+viscous call and rebuilt only if `M`, `Re` or `polar_source` change.
 
 ### Loads
 
@@ -131,6 +155,17 @@ $C_d$. The chordwise load distribution remains the flat-plate one.
 
 ## Tests
 
+The regression suite in `tests/` runs with the standard library, no extra package:
+
+```bash
+python -m unittest discover -s tests
+```
+
+It covers the viscous coupling under sideslip, the viscous jacobian against finite
+differences, the derivative table (labels, physical signs, rotation about the CG), trim,
+polars and deflection limits, the glide balance, and the state-space matrices against the
+jacobian of the nonlinear rigid-body equations. It needs NeuralFoil and takes about 30 s.
+The sections below are the convergence and validation studies behind the method.
 
 ### Reference case: rectangular wing $AR = 8$
 
@@ -292,6 +327,85 @@ restricted to $C_L$ and $C_m$.
 
 With the solver in float64 (`jax_enable_x64`) the decay is **monotone and exactly second
 order**: every 10× reduction in $h$ buys 100× less error, across eight orders of magnitude.
+## Flight dynamics
+
+Everything here is built on `coefficientsAt` and works on either path (`viscous=`). Angles
+go in in degrees, as everywhere else.
+
+### Rates and moment reference
+
+A body rate `omega` [rad/s] adds $-\boldsymbol\omega \times (\mathbf r - \mathbf r_{CG})$ to the
+onset flow, at the collocation points and at the bound vortices alike, so a rate rotates the
+aircraft about `CG`, the same point the moments are taken about. $C_{l_p}$, $C_{m_q}$ and
+$C_{n_r}$ come out negative, and moving the CG gives the same derivatives as translating the
+mesh by the opposite amount.
+
+### Derivatives
+
+```python
+d = airplane.derivativesAt(alpha=3.0, beta=0.0, deltas=deltas, viscous=True)
+d['Cm', 'q_hat']    # one value
+d.values            # 6 x (5 + controls)
+print(d)            # labelled table
+```
+
+Rows are $C_D, C_Y, C_L, C_l, C_m, C_n$ in stability axes, moments about the CG. Columns are
+$\alpha$, $\beta$ and each control **per radian**, and the stability-axis rates
+$\hat p = pb/2V$, $\hat q = q\bar c/2V$, $\hat r = rb/2V$, converted to body rates inside. One
+`jax.jacfwd` gives the whole table. `stabilityDerivatives` and `controlDerivatives` remain
+for $d/d\alpha$ and $d/d\delta$ alone: inviscid and per degree.
+
+### Trim and polars
+
+```python
+t = airplane.trim(alpha=3.0, control='elevator', viscous=True)
+t.deflection, t.deltas, t.coefficients, t.converged
+
+p = airplane.polar(alphas, deltas, viscous=True)              # fixed deflections
+p = airplane.trimmedPolar(alphas, 'elevator', viscous=True)   # re-trimmed at every alpha
+p['CL'], p['CD'], p['elevator'], p.converged, p.within_limits
+```
+
+`trim` solves $C_m = 0$ by Newton on the AD slope $\partial C_m/\partial\delta$, in three or four
+iterations; it counts as converged only if the viscous coupling converged too. Its $C_m$
+tolerance is `cm_tol`, so `tol`, `n_iter` and `relax` reach the viscous solver as in
+`coefficientsAt`. In a `Polar`, points that did not converge are NaN. The trimmed polar
+includes trim drag and the tail's share of lift, so it is the one to use for performance.
+
+Two optional keys in a `control_surfaces` dict feed these methods: `limits=(min, max)` in
+degrees, which sets `within_limits` (a control on several surfaces keeps the tightest
+limits), and `axis='longitudinal'` or `'lateral'` for `stateSpace`.
+
+### Mass properties and glide
+
+```python
+airplane = Aircraft(surfaces, CG, ..., mass=110.0, inertia=(Ixx, Iyy, Izz, Ixz), rho=1.225, g=9.81)
+V, gamma, sink = airplane.glideState(p['CL'], p['CD'])
+```
+
+`inertia` is about the CG in the geometry axes, with $I_{xz} = \sum xz\,dm$. `glideState` takes
+scalars or arrays, so a trimmed polar gives the speed polar directly. It solves the exact
+glide balance, resultant force equal to weight:
+$V = \sqrt{2mg\cos\gamma/(\rho S C_L)}$, $\gamma = -\arctan(C_D/C_L)$, NaN where $C_L \le 0$.
+
+### Linear model
+
+```python
+ss = airplane.stateSpace(alpha=3.0, control='elevator', viscous=True)
+ss.A_lon, ss.B_lon    # x = [u, w, q, theta], inputs ss.lon_controls [rad]
+ss.A_lat, ss.B_lat    # x = [v, p, r, phi],   inputs ss.lat_controls [rad]
+ss.V0, ss.gamma, ss.trim, ss.derivatives
+```
+
+`stateSpace` trims at $\alpha$, takes $V_0$ and $\theta_0 = \gamma$ from `glideState` and the
+derivatives from `derivativesAt`, and assembles the small-disturbance equations in stability
+axes: Nelson's dimensional derivatives plus $X_q$ (Etkin), with $I_{xz}$ entering through the
+primed rolling and yawing derivatives. The inertias are rotated from the geometry axes into
+the stability axes at $\alpha$. A control goes to the axis named in its dict, or else to the
+one whose coefficients it moves most, so a rudder (`mode='symmetric'` on a fin) lands in the
+lateral set by itself. The matrices equal the jacobian of the nonlinear rigid-body equations,
+written in the trim stability axes with forces from `coefficientsAt`, to about $10^{-9}$.
+
 ## Comparison with AeroSandbox's VLM
 
 Validation against `asb.VortexLatticeMethod` from
@@ -371,7 +485,12 @@ small (~0.004-0.005) and of the same sign and order of magnitude;
 
 The current state of the code does not take into account any body elements, and its tail refinement seems to have a severe impact on the prediction of the position of the neutral point of the aircraft.
 
-As the present code was designed with clarity in mind as a study for the Vortex Lattice Method, its computational performance is sub-optimal both in the sense of time and memory allocation. As such, this limits its application to MDO and optimization, which need to explore a large number of possibilities. A viscous run compounds this: the coupling re-assembles the AIC and re-solves the linear system at every iteration, so one flight condition costs roughly twenty inviscid solves.
+As the present code was designed with clarity in mind as a study for the Vortex Lattice Method, its computational performance is sub-optimal both in the sense of time and memory allocation. As such, this limits its application to MDO and optimization, which need to explore a large number of possibilities. A viscous flight condition costs about one or two inviscid solves once the factorization exists, with near-stall points costing several times more.
+
+The linear model takes $C_{D_u}$, $C_{L_u}$ and $C_{m_u}$ as zero (low Mach), and a steady
+lattice gives no $\dot\alpha$ derivatives, so the short period is slightly under-damped. `Re` is an
+input, independent of the trim speed that the mass sets: keep the two consistent by hand.
+Control deflections follow this code's own sign convention, not necessarily Etkin's or Nelson's.
 
 The test results reported below were all produced on the inviscid path; the viscous coupling is verified separately, against synthetic polars with a known closed-form answer and against the 2D limit at high aspect ratio.
 

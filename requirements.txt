@@ -6,5 +6,6 @@ numpy>=2.2.6
 # longer builds against modern setuptools. Needs gfortran, cmake, make.
 xfoil @ git+https://github.com/DARcorporation/xfoil-python.git@1.1.1
 
-# only needed for the AeroSandbox comparison scripts in docs/
+# polar_source='neuralfoil' and the AeroSandbox comparison scripts in docs/
+neuralfoil>=0.3.2
 aerosandbox>=4.2.8

@@ -1,11 +1,17 @@
+import warnings
+from dataclasses import dataclass
+
 import jax
 import jax.numpy as np
+from jax.scipy.linalg import lu_factor, lu_solve
 import numpy
 jax.config.update("jax_enable_x64", True)
+jax.config.update("jax_platforms", "cpu")
 
 import matplotlib
 from matplotlib import pyplot as plt
-matplotlib.use('TkAgg')
+if __name__ == "__main__":
+    matplotlib.use('TkAgg')
 
 
 def _style_dark(fig, axes):
@@ -47,6 +53,78 @@ def _style_dark(fig, axes):
                 toolbar._set_image_for_button(button)
 
 
+@dataclass
+class Derivatives:
+    """Jacobian with named rows and columns: d['Cm', 'alpha']."""
+    values: jax.Array
+    rows: tuple
+    columns: tuple
+
+    def __getitem__(self, key):
+        row, column = key
+        return self.values[self.rows.index(row), self.columns.index(column)]
+
+    def __str__(self):
+        width = max(9, *(len(c) + 1 for c in self.columns))
+        lines = [f"{'':>4} " + " ".join(f"{c:>{width}}" for c in self.columns)]
+        lines += [f"{r:>4} " + " ".join(f"{float(v):{width}.4f}" for v in row) for r, row in zip(self.rows, self.values)]
+        return "\n".join(lines)
+
+
+@dataclass
+class Trim:
+    """Trimmed state: deflections [deg] of every control and (CD, CY, CL, Cl, Cm, Cn) there."""
+    alpha: float
+    control: str
+    deltas: jax.Array
+    coefficients: jax.Array
+    converged: bool
+    iterations: int
+    control_names: tuple
+
+    @property
+    def deflection(self):
+        return self.deltas[self.control_names.index(self.control)]
+
+
+@dataclass
+class Polar:
+    """Sweep in alpha [deg]. p['CL'] is a coefficient column (NaN where not converged), p['elevator'] a deflection [deg]."""
+    alpha: numpy.ndarray
+    coefficients: numpy.ndarray
+    deltas: numpy.ndarray
+    converged: numpy.ndarray
+    within_limits: numpy.ndarray
+    control_names: tuple
+    names = ('CD', 'CY', 'CL', 'Cl', 'Cm', 'Cn')
+
+    def __getitem__(self, name):
+        if name in self.names:
+            return self.coefficients[:, self.names.index(name)]
+        return self.deltas[:, self.control_names.index(name)]
+
+
+@dataclass
+class StateSpace:
+    """
+    Small disturbances about a steady glide, stability axes: x' = A x + B u.
+    Longitudinal x = [u, w, q, theta], lateral-directional x = [v, p, r, phi];
+    u, v, w [m/s], p, q, r [rad/s], angles [rad], inputs: control deflections [rad].
+    """
+    A_lon: numpy.ndarray
+    B_lon: numpy.ndarray
+    A_lat: numpy.ndarray
+    B_lat: numpy.ndarray
+    lon_controls: tuple
+    lat_controls: tuple
+    trim: Trim
+    V0: float
+    gamma: float
+    derivatives: Derivatives
+    lon_states = ('u', 'w', 'q', 'theta')
+    lat_states = ('v', 'p', 'r', 'phi')
+
+
 class Surface():
     """
     One lifting surface, built as a chain of trapezoidal segments.
@@ -60,7 +138,9 @@ class Surface():
     position        (x,y,z) of the root three-quarter-chord point [m] -- the LE sits 0.75*chord ahead of it, the TE 0.25*chord behind
     discretization  per segment (n, m): n nodes along the chord, m along the span. n must be the same in every segment
     symmetry        mirror about y=0; requires the root to sit on that plane
-    control_surfaces  list of dicts: name, hinge (x/c from the LE), span (pair of semi-span fractions), mode ('symmetric'/'antisymmetric'), gain (optional multiplier)
+    control_surfaces  list of dicts: name, hinge (x/c from the LE), span (pair of semi-span fractions), mode ('symmetric'/'antisymmetric'), gain (optional multiplier),
+                      limits (optional (min, max) deflection [deg], flagged by polar/trimmedPolar),
+                      axis (optional 'longitudinal'/'lateral' for stateSpace; by default the axis it mostly acts on)
     airfoils        NACA 4-digit code at each breakpoint, same length as chord. The lattice
                     itself stays flat: the code selects the XFOIL polar for that station, and
                     the polar carries camber, thickness, Re, transition and stall. The
@@ -254,6 +334,7 @@ class Surface():
             ax.scatter(*np.moveaxis(self.collocation, -1, 0))
         
         return fig, ax
+  
             
 class Aircraft():
     """
@@ -265,19 +346,29 @@ class Aircraft():
     CG        (x,y,z) moment reference point [m]
     M         free stream Mach number, for the sectional polars
     Re        free stream Reynolds number on the MAC, required for a viscous run; each section scales it by its own chord
+    polar_source  'xfoil' or 'neuralfoil'. NeuralFoil is incompressible, so it ignores M
+    mass      [kg], needed by glideState and the flight dynamics methods
+    inertia   (Ixx, Iyy, Izz, Ixz) [kg m^2] about the CG in these axes; Ixz = sum(x z dm)
+    rho, g    air density [kg/m^3] and gravity [m/s^2]
 
     A viscous run builds its polars on first use and rebuilds them if M or Re change.
     Surfaces left at the default '0000' airfoil have no polar and stay inviscid.
 
     Angles are in degrees at every boundary: alpha, beta and the control deflections
-    passed to simulate/coefficientsAt. Velocities are non-dimensionalised by V_inf, so
-    the returned coefficients and the AD derivatives are per degree of deflection.
+    passed to coefficientsAt and the methods built on it. Velocities are non-dimensionalised
+    by V_inf. stabilityDerivatives and controlDerivatives are per degree; derivativesAt is
+    per radian and per nondimensional rate.
     """
-    def __init__(self, surfaces, CG, M=0.0, Re=None):
+    def __init__(self, surfaces, CG, M=0.0, Re=None, polar_source='xfoil', mass=None, inertia=None, rho=1.225, g=9.81):
         self.surfaces = surfaces
         self.CG = CG
         self.M = M
         self.Re = Re
+        self.polar_source = polar_source
+        self.mass = mass
+        self.inertia = None if inertia is None else numpy.asarray(inertia, dtype=float)
+        self.rho = rho
+        self.g = g
         self.polar_conditions = None
         self.nodes  = []
         self.aero_centers = []
@@ -367,6 +458,16 @@ class Aircraft():
                     names.append(name)
         self.control_names = names
 
+        # a control on several surfaces keeps the tightest of their limits
+        lower, upper = numpy.full(len(names), -numpy.inf), numpy.full(len(names), numpy.inf)
+        for surface in self.surfaces:
+            for c in surface.control_surfaces:
+                if 'limits' in c:
+                    k = names.index(c['name'])
+                    lower[k], upper[k] = max(lower[k], c['limits'][0]), min(upper[k], c['limits'][1])
+        self.control_limits = numpy.stack([lower, upper], axis=1).reshape(-1, 2)
+        self.control_axes = {c['name']: c['axis'] for surface in self.surfaces for c in surface.control_surfaces if 'axis' in c}
+
         rows = []
         for name in names:
             parts = []
@@ -380,6 +481,10 @@ class Aircraft():
 
         # the horseshoe kernels depend on the mesh alone, so they are built with it
         self.computeInfluences()
+
+        self.reference = max(self.surfaces, key = lambda surf: surf.S)
+        self.viscous_operator = (None, None)
+        self.resetViscousSolver()
 
     def plot(self, **kwargs):
 
@@ -460,16 +565,23 @@ class Aircraft():
         # normal velocity each unit-strength horseshoe induces at every collocation point
         return np.sum(self.influence_collocation * normals[:,None,:], axis = -1)
 
+    def onsetVelocity(self, V_bar, omega_bar, points):
+        # air velocity relative to a body rotating at omega_bar about the CG: V - omega x (r - r_CG)
+        return V_bar - np.cross(omega_bar[None,:], points - self.CG, axis=-1)
+
+    def boundVelocity(self, circulation, V_bar, omega_bar):
+        # total velocity at each bound vortex, in the sign convention of the force terms
+        induced = np.sum(self.influence_aero * circulation[None,:,None], axis=1)
+        return induced - self.onsetVelocity(V_bar, omega_bar, self.aero_centers)
+
     def solveSystem(self, AIC, normals, V_bar, omega_bar=np.array([0.0, 0.0, 0.0])):
-        # flow tangency: the circulations must cancel the onset velocity normal to each
-        # panel, onset being the freestream plus the rotation rate at that point
-        V_panel = V_bar + np.cross(omega_bar[None,:], self.collocation, axis=-1)
-        b =  np.sum(V_panel * normals, axis = -1)
+        # flow tangency: the circulations must cancel the onset velocity normal to each panel
+        b =  np.sum(self.onsetVelocity(V_bar, omega_bar, self.collocation) * normals, axis = -1)
         return np.linalg.solve(AIC, b)
 
     def computeInviscousCoefficients(self, circulation, alpha, V_bar, omega_bar=np.array([0.0, 0.0, 0.0])):
         # Every reference length comes from one surface, the largest by area
-        reference = max(self.surfaces, key = lambda surf: surf.S)
+        reference = self.reference
         S_ref, chord_ref, span_ref = reference.S, reference.MAC, reference.b
 
         # body -> stability axes
@@ -479,9 +591,7 @@ class Aircraft():
             [ np.sin(np.deg2rad(alpha)), 0.0, -np.cos(np.deg2rad(alpha))]
         ])
 
-        # Total velocity at each bound vortex
-        induced = np.sum(self.influence_aero * circulation[None,:,None], axis=1)
-        V_bar_i = induced - V_bar - np.cross(omega_bar[None,:], self.aero_centers)
+        V_bar_i = self.boundVelocity(circulation, V_bar, omega_bar)
 
         F_bar_i = (2/S_ref) * np.cross(V_bar_i, self.vortex_b-self.vortex_a) * circulation[:,None]
         M_bar_i = np.cross(self.aero_centers - self.CG, F_bar_i)   # eq. 6.49, arm from the CG
@@ -497,7 +607,7 @@ class Aircraft():
         return CD_i, CY, CL, Cl, Cm, Cn
 
     # Polar methods
-    def trimPolar(self, alpha, cl, cd, cm, max_gap=2):
+    def cropPolar(self, alpha, cl, cd, cm, max_gap=2):
         # grow outward from alpha=0, bridging short non-converged gaps but stopping at a wide one
         converged = ~(numpy.isnan(cl) | numpy.isnan(cd) | numpy.isnan(cm))
         zero = int(numpy.argmin(numpy.abs(alpha)))
@@ -526,8 +636,37 @@ class Aircraft():
         result[0] = self.alphaSequence(a_start, a_end, d_alpha)
         return result
 
-    def generatePolars(self, M=None, Re=None, alpha_range=(-14.0, 22.0), d_alpha=0.25, n_crit=9.0, max_iter=250):
+    def xfoilPolar(self, alpha_range, d_alpha, n_crit, max_iter):
         from xfoil import XFoil
+
+        xf = XFoil()
+        xf.print, xf.max_iter, xf.M, xf.n_crit = False, max_iter, self.M, n_crit
+
+        def polar(airfoil, section_Re):
+            xf.naca(airfoil)
+            xf.Re = section_Re
+            up = self.sweepPolar(xf, 0.0, alpha_range[1] + d_alpha, d_alpha)
+            xf.reset_bls()   # clean BL state for the downward march
+            down = self.sweepPolar(xf, -d_alpha, alpha_range[0] - d_alpha, d_alpha)[:, ::-1]
+            alpha, cl, cd, cm = self.cropPolar(*numpy.concatenate([down, up], axis=1)[:4])
+            return np.stack([np.interp(self.polar_alpha, alpha, cl),
+                             np.interp(self.polar_alpha, alpha, cd),
+                             np.interp(self.polar_alpha, alpha, cm)])
+        return polar
+
+    def neuralfoilPolar(self, n_crit):
+        import aerosandbox as asb
+        import neuralfoil
+
+        def polar(airfoil, section_Re):
+            aero = neuralfoil.get_aero_from_airfoil(asb.Airfoil(f'naca{airfoil}'), alpha=numpy.asarray(self.polar_alpha),
+                                                    Re=section_Re, n_crit=n_crit)
+            return np.stack([aero['CL'], aero['CD'], aero['CM']])
+        return polar
+
+    def generatePolars(self, M=None, Re=None, alpha_range=(-14.0, 22.0), d_alpha=0.25, n_crit=9.0, max_iter=250):
+        if self.polar_source not in ('xfoil', 'neuralfoil'):
+            raise ValueError(f"unknown polar_source: {self.polar_source!r}")
 
         self.M = self.M if M is None else M
         self.Re = self.Re if Re is None else Re
@@ -536,11 +675,12 @@ class Aircraft():
         if not any(surface.viscous for surface in self.surfaces):
             raise RuntimeError("no surface carries an airfoil: give at least one a NACA code other than '0000'")
 
-        chord_ref = max(self.surfaces, key = lambda surf: surf.S).MAC
+        chord_ref = self.reference.MAC
         self.polar_alpha = np.arange(alpha_range[0], alpha_range[1] + d_alpha, d_alpha)
 
-        xf, cache, self.polars = XFoil(), {}, []
-        xf.print, xf.max_iter, xf.M, xf.n_crit = False, max_iter, self.M, n_crit
+        polar = (self.neuralfoilPolar(n_crit) if self.polar_source == 'neuralfoil'
+                 else self.xfoilPolar(alpha_range, d_alpha, n_crit, max_iter))
+        cache, self.polars = {}, []
 
         for surface in self.surfaces:
             for airfoil, chord in zip(surface.airfoils, surface.chord):
@@ -550,25 +690,19 @@ class Aircraft():
                 section_Re = self.Re * chord / chord_ref
                 key = (str(airfoil), round(float(section_Re), 6))
                 if key not in cache:
-                    xf.naca(str(airfoil))
-                    xf.Re = section_Re
-                    up = self.sweepPolar(xf, 0.0, alpha_range[1] + d_alpha, d_alpha)
-                    xf.reset_bls()   # clean BL state for the downward march
-                    down = self.sweepPolar(xf, -d_alpha, alpha_range[0] - d_alpha, d_alpha)[:, ::-1]
-                    alpha, cl, cd, cm = self.trimPolar(*numpy.concatenate([down, up], axis=1)[:4])
-                    cache[key] = np.stack([np.interp(self.polar_alpha, alpha, cl),
-                                           np.interp(self.polar_alpha, alpha, cd),
-                                           np.interp(self.polar_alpha, alpha, cm)])
+                    cache[key] = polar(str(airfoil), section_Re)
                 self.polars.append(cache[key])
 
         self.polars = np.stack(self.polars)
         self.strip_polar = self.polars[self.polar_index]
         self.strip_polar_tip = self.polars[numpy.minimum(self.polar_index + 1, len(self.polars) - 1)]
-        self.polar_conditions = (self.M, self.Re)
+        self.polar_conditions = (self.M, self.Re, self.polar_source)
+        self.resetViscousSolver()
 
     def ensurePolars(self):
-        if self.polar_conditions != (self.M, self.Re):
-            self.generatePolars()
+        if self.polar_conditions != (self.M, self.Re, self.polar_source):
+            with jax.ensure_compile_time_eval():   # a first call under jax.jit must not store tracers
+                self.generatePolars()
 
     # Viscous methods
     def stripCl(self, circulation):
@@ -581,23 +715,62 @@ class Aircraft():
         # component of the freestream normal to the c/4 line; handles dihedral and fins automatically
         return np.sqrt(1.0 - np.sum(self.quarter_chord_axis * V_bar, axis=-1)**2)
 
-    def solveViscous(self, normals, V_bar, omega_bar=np.array([0.0, 0.0, 0.0]), relax=1.0, n_iter=20):
-        """Alpha coupling (Parenteau sec. 2.3), at a fixed iteration count so jax.jacfwd can trace it."""
+    def viscousOperator(self, normals):
+        # n(theta) = cos*n + sin*(h x n), so AIC(theta) = diag(cos)*A0 + diag(sin)*A1
+        tangents = np.cross(self.hinge_axis, normals)
+        A0 = self.computeAIC(normals)
+        return normals, tangents, A0, self.computeAIC(tangents), lu_factor(A0)
+
+    def viscousOperatorAt(self, deltas):
+        normals = self.deflect(deltas)
+        if isinstance(normals, jax.core.Tracer):
+            return self.viscousOperator(normals)
+        # independent of alpha and beta, so a sweep shares one factorization
+        key = numpy.asarray(normals).tobytes()
+        if key != self.viscous_operator[0]:
+            self.viscous_operator = (key, self.viscousOperator(normals))
+        return self.viscous_operator[1]
+
+    def resetViscousSolver(self):
+        # the trace holds mesh and polars as constants; a new lambda forces a retrace
+        self.viscousSolver = jax.jit(lambda *args: self.solveViscous(*args))
+
+    def solveViscous(self, operator, V_bar, omega_bar, relax, n_iter, tol):
+        """Alpha coupling (Parenteau sec. 2.3), each pass correcting the circulation against the LU of A0.
+        Stops on the residual: forward-mode only, so jax.jacfwd traces it and jax.jacrev does not."""
+        normals, tangents, A0, A1, lu = operator
         cos_phi = self.sweepCosine(V_bar)
+        V_panel = self.onsetVelocity(V_bar, omega_bar, self.collocation)
+        b0, b1 = np.sum(V_panel*normals, axis=-1), np.sum(V_panel*tangents, axis=-1)
 
-        def solveAt(delta_alpha):
-            rotated = self.rotateNormals(normals, -self.stripBroadcast(delta_alpha)*self.panel_viscous)
-            return self.solveSystem(self.computeAIC(rotated), rotated, V_bar, omega_bar)
+        def correct(delta_alpha, circulation):
+            theta = -self.stripBroadcast(delta_alpha)*self.panel_viscous
+            residual = np.cos(theta)*(b0 - A0 @ circulation) + np.sin(theta)*(b1 - A1 @ circulation)
+            return circulation + lu_solve(lu, residual), np.max(np.abs(residual))
 
-        def step(_, delta_alpha):
-            Cl_inv = self.stripCl(solveAt(delta_alpha))
+        def step(state):
+            delta_alpha, circulation, _, i = state
+            circulation, linear = correct(delta_alpha, circulation)
+            Cl_inv = self.stripCl(circulation)
             alpha_e = Cl_inv/(2*np.pi) + delta_alpha
             Cl_visc = self.sectionCoefficients(alpha_e, cos_phi)[0]
-            return delta_alpha - relax*(Cl_visc - Cl_inv)/(2*np.pi)*self.strip_viscous
+            update = relax*(Cl_visc - Cl_inv)/(2*np.pi)*self.strip_viscous
+            return delta_alpha - update, circulation, np.maximum(linear, np.max(np.abs(update))), i + 1
 
-        delta_alpha = jax.lax.fori_loop(0, n_iter, step, np.zeros(self.n_strips))
-        circulation = solveAt(delta_alpha)
-        return circulation, self.stripCl(circulation)/(2*np.pi) + delta_alpha, cos_phi, delta_alpha
+        def running(state):
+            # written so a NaN residual keeps running and ends up reported, rather than stopping as converged
+            return np.logical_and(np.logical_not(state[2] <= tol), state[3] < n_iter)
+
+        start = (np.zeros(self.n_strips), lu_solve(lu, b0), np.array(np.inf), 0)
+        delta_alpha, circulation, residual, _ = jax.lax.while_loop(running, step, start)
+        for _ in range(3):
+            circulation, _ = correct(delta_alpha, circulation)
+        return circulation, self.stripCl(circulation)/(2*np.pi) + delta_alpha, cos_phi, delta_alpha, residual
+
+    def warnUnconverged(self, alpha, beta, residual, tol):
+        if not residual <= tol:
+            warnings.warn(f"viscous coupling not converged at alpha={float(alpha):.2f}, beta={float(beta):.2f}: "
+                          f"residual {float(residual):.1e} > tol {float(tol):.1e}")
 
     def stripSum(self, values):
         return jax.ops.segment_sum(values, self.panel_strip, num_segments=self.n_strips)
@@ -623,7 +796,7 @@ class Aircraft():
         return np.sum(F_visc, axis=0), np.sum(M_visc, axis=0)
 
     def computeViscousCoefficients(self, circulation, alpha, V_bar, alpha_e, cos_phi, omega_bar=np.array([0.0, 0.0, 0.0])):
-        reference = max(self.surfaces, key = lambda surf: surf.S)
+        reference = self.reference
         S_ref, chord_ref, span_ref = reference.S, reference.MAC, reference.b
 
         T_a = np.array([
@@ -632,8 +805,7 @@ class Aircraft():
             [ np.sin(np.deg2rad(alpha)), 0.0, -np.cos(np.deg2rad(alpha))]
         ])
 
-        induced = np.sum(self.influence_aero * circulation[None,:,None], axis=1)
-        V_bar_i = induced - V_bar - np.cross(omega_bar[None,:], self.aero_centers)
+        V_bar_i = self.boundVelocity(circulation, V_bar, omega_bar)
 
         F_bar_i = (2/S_ref) * np.cross(V_bar_i, self.vortex_b-self.vortex_a) * circulation[:,None]
         M_bar_i = np.cross(self.aero_centers - self.CG, F_bar_i)
@@ -649,10 +821,8 @@ class Aircraft():
 
         return CD, CY, CL, Cl, Cm, Cn
 
-    def coefficientsAt(self, alpha, beta, deltas, V_inf=1.0, omega=np.array([0.0, 0.0, 0.0]), viscous=False, relax=1.0, n_iter=20):
-        """
-        written as a pure function of the deflection so jax.jacfwd can differentiate it.
-        """
+    def coefficientsWithResidual(self, alpha, beta, deltas, V_inf=1.0, omega=np.array([0.0, 0.0, 0.0]), viscous=False, relax=1.0, n_iter=200, tol=1e-8):
+        """coefficientsAt without the warning, plus (converged, residual) of the viscous coupling; inviscid is always converged."""
         V_bar = np.array([
             -np.cos(np.deg2rad(alpha))*np.cos(np.deg2rad(beta)),
             -np.sin(np.deg2rad(beta)),
@@ -660,24 +830,185 @@ class Aircraft():
 
         omega_bar = omega/V_inf
 
-        normals = self.deflect(deltas)
-
         if viscous:
             self.ensurePolars()
-            circulation, alpha_e, cos_phi, _ = self.solveViscous(normals, V_bar, omega_bar, relax, n_iter)
-            return self.computeViscousCoefficients(circulation, alpha, V_bar, alpha_e, cos_phi, omega_bar)
+            circulation, alpha_e, cos_phi, _, residual = self.viscousSolver(self.viscousOperatorAt(deltas), V_bar, omega_bar, relax, n_iter, tol)
+            coefficients = self.computeViscousCoefficients(circulation, alpha, V_bar, alpha_e, cos_phi, omega_bar)
+            return coefficients, residual <= tol, residual
 
+        normals = self.deflect(deltas)
         circulation = self.solveSystem(self.computeAIC(normals), normals, V_bar, omega_bar)
-        return self.computeInviscousCoefficients(circulation, alpha, V_bar, omega_bar)
+        return self.computeInviscousCoefficients(circulation, alpha, V_bar, omega_bar), np.array(True), np.array(0.0)
+
+    def coefficientsAt(self, alpha, beta, deltas, V_inf=1.0, omega=np.array([0.0, 0.0, 0.0]), viscous=False, relax=1.0, n_iter=200, tol=1e-8):
+        """
+        written as a pure function of the deflection so jax.jacfwd can differentiate it.
+        n_iter caps the viscous coupling, which stops once the residual falls below tol [rad].
+        """
+        coefficients, _, residual = self.coefficientsWithResidual(alpha, beta, deltas, V_inf, omega, viscous, relax, n_iter, tol)
+        if viscous:
+            jax.debug.callback(self.warnUnconverged, alpha, beta, residual, tol)
+        return coefficients
 
     # Flight Dynamics methods
+    def derivativesAt(self, alpha, beta, deltas=None, viscous=False, **solver):
+        """
+        Jacobian of (CD, CY, CL, Cl, Cm, Cn), moments about the CG, in stability axes.
+        Columns: alpha, beta and each control per radian; p_hat = pb/2V, q_hat = qc/2V and
+        r_hat = rb/2V are stability-axis rates. Inviscid CD is the induced drag only.
+        solver: relax, n_iter, tol, passed to coefficientsAt.
+        """
+        deltas = np.zeros(len(self.control_names)) if deltas is None else np.asarray(deltas, dtype=float)
+        b, c = self.reference.b, self.reference.MAC
+
+        def coefficients(x):
+            a = x[0]
+            p, q, r = 2*x[2]/b, 2*x[3]/c, 2*x[4]/b
+            omega = np.array([p*np.cos(a) - r*np.sin(a), q, p*np.sin(a) + r*np.cos(a)])   # stability -> body
+            return np.array(self.coefficientsAt(np.rad2deg(a), np.rad2deg(x[1]), np.rad2deg(x[5:]),
+                                                omega=omega, viscous=viscous, **solver))
+
+        x0 = np.concatenate([np.deg2rad(np.array([alpha, beta], dtype=float)), np.zeros(3), np.deg2rad(deltas)])
+        return Derivatives(jax.jacfwd(coefficients)(x0),
+                           rows=('CD', 'CY', 'CL', 'Cl', 'Cm', 'Cn'),
+                           columns=('alpha', 'beta', 'p_hat', 'q_hat', 'r_hat', *self.control_names))
+
+    def trim(self, alpha, control='elevator', beta=0.0, deltas=None, viscous=True, guess=0.0, cm_tol=1e-6, max_iter=10, **solver):
+        """
+        Deflection of `control` [deg] that gives Cm = 0 at alpha [deg]: Newton on the AD slope dCm/d(delta).
+        deltas sets the other controls [deg]; solver: relax, n_iter, tol of the viscous coupling.
+        Converged when |Cm| <= cm_tol and the viscous coupling converged at that point.
+        """
+        deltas = np.zeros(len(self.control_names)) if deltas is None else np.asarray(deltas, dtype=float)
+        k = self.control_names.index(control)
+
+        def f(d):
+            coefficients, solved, _ = self.coefficientsWithResidual(alpha, beta, deltas.at[k].set(d), viscous=viscous, **solver)
+            return np.array(coefficients), solved
+
+        d = np.array(float(guess))
+        for iteration in range(1, max_iter + 1):
+            coefficients, slope, solved = jax.jvp(f, (d,), (np.ones_like(d),), has_aux=True)
+            if not abs(coefficients[4]) > cm_tol or iteration == max_iter:
+                break
+            d = d - coefficients[4]/slope[4]
+
+        return Trim(alpha=alpha, control=control, deltas=deltas.at[k].set(d), coefficients=coefficients,
+                    converged=bool(abs(coefficients[4]) <= cm_tol and solved), iterations=iteration,
+                    control_names=tuple(self.control_names))
+
+    def polar(self, alphas, deltas=None, beta=0.0, viscous=True, **solver):
+        """Coefficients at each alpha [deg] with fixed deltas [deg]; solver: relax, n_iter, tol."""
+        deltas = np.zeros(len(self.control_names)) if deltas is None else np.asarray(deltas, dtype=float)
+        points = [self.coefficientsWithResidual(float(a), beta, deltas, viscous=viscous, **solver) for a in alphas]
+        return self.polarResult(alphas, [p[0] for p in points], [deltas]*len(points), [bool(p[1]) for p in points])
+
+    def trimmedPolar(self, alphas, control='elevator', deltas=None, beta=0.0, viscous=True, guess=0.0, **options):
+        """
+        polar with `control` re-trimmed to Cm = 0 at every alpha, each trim starting from the last converged one.
+        options: cm_tol, max_iter of trim and relax, n_iter, tol of the viscous coupling.
+        """
+        trims = []
+        for a in alphas:
+            t = self.trim(float(a), control, beta, deltas, viscous, guess=guess, **options)
+            guess = float(t.deflection) if t.converged else guess
+            trims.append(t)
+        return self.polarResult(alphas, [t.coefficients for t in trims], [t.deltas for t in trims], [t.converged for t in trims])
+
+    def polarResult(self, alphas, coefficients, deltas, converged):
+        converged = numpy.array(converged, dtype=bool)
+        coefficients = numpy.array(coefficients, dtype=float).reshape(len(converged), 6)
+        coefficients[~converged] = numpy.nan
+        deltas = numpy.array(deltas, dtype=float).reshape(len(converged), len(self.control_names))
+        within = numpy.all((deltas >= self.control_limits[:, 0]) & (deltas <= self.control_limits[:, 1]), axis=1)
+        return Polar(numpy.asarray(alphas, dtype=float), coefficients, deltas, converged, within, tuple(self.control_names))
+
+    def glideState(self, CL, CD):
+        """
+        Steady unpowered glide for coefficients (scalars or arrays, e.g. a trimmed polar):
+        airspeed V [m/s], flight path angle gamma [rad] (negative = descending) and sink rate [m/s].
+        Resultant aerodynamic force = weight, so L = W cos(gamma); NaN where CL <= 0.
+        """
+        if self.mass is None:
+            raise RuntimeError("glideState needs the mass: Aircraft(..., mass=...)")
+        CL, CD = numpy.asarray(CL, dtype=float), numpy.asarray(CD, dtype=float)
+        gamma = -numpy.arctan2(CD, CL)
+        with numpy.errstate(invalid='ignore', divide='ignore'):
+            V = numpy.where(CL > 0, numpy.sqrt(2*self.mass*self.g*numpy.cos(gamma) / (self.rho*self.reference.S*CL)), numpy.nan)
+        return V, gamma, -V*numpy.sin(gamma)
+
+    def stabilityInertia(self, alpha):
+        """(Ixx, Iyy, Izz, Ixz) rotated from the geometry axes into the stability axes at alpha [deg]."""
+        Ixx, Iyy, Izz, Ixz = self.inertia
+        c, s = numpy.cos(numpy.deg2rad(alpha)), numpy.sin(numpy.deg2rad(alpha))
+        return (Ixx*c*c + Izz*s*s - 2*Ixz*s*c, Iyy,
+                Ixx*s*s + Izz*c*c + 2*Ixz*s*c, (Ixx - Izz)*s*c + Ixz*(c*c - s*s))
+
+    def stateSpace(self, alpha, control='elevator', deltas=None, viscous=True, **solver):
+        """
+        Linearised glide about the trim at alpha [deg], `control` re-trimmed to Cm = 0; stability axes, theta0 = gamma.
+        Nelson's dimensional derivatives plus X_q (Etkin), Ixz through the primed rolling and yawing derivatives.
+        C_Du, C_Lu, C_mu (low Mach) and the alpha-dot derivatives (steady VLM) are taken as zero.
+        Controls go to the axis set in their dict, or else to the one whose coefficients they move most.
+        """
+        if self.mass is None or self.inertia is None:
+            raise RuntimeError("stateSpace needs Aircraft(..., mass=..., inertia=...)")
+        trim = self.trim(alpha, control, deltas=deltas, viscous=viscous, **solver)
+        if not trim.converged:
+            warnings.warn(f"stateSpace: trim not converged at alpha={alpha}")
+        CD0, CL0 = float(trim.coefficients[0]), float(trim.coefficients[2])
+        V0, theta0, _ = (float(v) for v in self.glideState(CL0, CD0))
+        derivatives = self.derivativesAt(alpha, 0.0, trim.deltas, viscous=viscous, **solver)
+
+        D = numpy.asarray(derivatives.values)
+        CD, CY, CL, Cl, Cm, Cn = range(6)
+        ALPHA, BETA, P, Q, R = range(5)
+        m, g, S, b, c = self.mass, self.g, self.reference.S, self.reference.b, self.reference.MAC
+        Ixx, Iyy, Izz, Ixz = self.stabilityInertia(alpha)
+        qS = 0.5*self.rho*V0**2*S
+
+        A_lon = numpy.array([
+            [-2*CD0*qS/(m*V0), (CL0 - D[CD, ALPHA])*qS/(m*V0), -D[CD, Q]*qS*c/(2*m*V0), -g*numpy.cos(theta0)],
+            [-2*CL0*qS/(m*V0), -(D[CL, ALPHA] + CD0)*qS/(m*V0), V0 - D[CL, Q]*qS*c/(2*m*V0), -g*numpy.sin(theta0)],
+            [0.0, D[Cm, ALPHA]*qS*c/(Iyy*V0), D[Cm, Q]*qS*c**2/(2*Iyy*V0), 0.0],
+            [0.0, 0.0, 1.0, 0.0]])
+
+        def primed(Cl_x, Cn_x, scale):
+            L, N = Cl_x*scale/Ixx, Cn_x*scale/Izz
+            k = 1 - Ixz**2/(Ixx*Izz)
+            return (L + Ixz/Ixx*N)/k, (N + Ixz/Izz*L)/k
+
+        Lv, Nv = primed(D[Cl, BETA], D[Cn, BETA], qS*b/V0)
+        Lp, Np = primed(D[Cl, P], D[Cn, P], qS*b**2/(2*V0))
+        Lr, Nr = primed(D[Cl, R], D[Cn, R], qS*b**2/(2*V0))
+        A_lat = numpy.array([
+            [D[CY, BETA]*qS/(m*V0), D[CY, P]*qS*b/(2*m*V0), D[CY, R]*qS*b/(2*m*V0) - V0, g*numpy.cos(theta0)],
+            [Lv, Lp, Lr, 0.0],
+            [Nv, Np, Nr, 0.0],
+            [0.0, 1.0, numpy.tan(theta0), 0.0]])
+
+        lon, lat, B_lon, B_lat = [], [], [], []
+        for k, name in enumerate(self.control_names):
+            col = D[:, 5 + k]
+            moves_lateral = numpy.linalg.norm(col[[CY, Cl, Cn]]) > numpy.linalg.norm(col[[CD, CL, Cm]])
+            if self.control_axes.get(name, 'lateral' if moves_lateral else 'longitudinal') == 'longitudinal':
+                lon.append(name)
+                B_lon.append([-col[CD]*qS/m, -col[CL]*qS/m, col[Cm]*qS*c/Iyy, 0.0])
+            else:
+                lat.append(name)
+                B_lat.append([col[CY]*qS/m, *primed(col[Cl], col[Cn], qS*b), 0.0])
+
+        return StateSpace(A_lon=A_lon, B_lon=numpy.array(B_lon).reshape(-1, 4).T, A_lat=A_lat,
+                          B_lat=numpy.array(B_lat).reshape(-1, 4).T, lon_controls=tuple(lon), lat_controls=tuple(lat),
+                          trim=trim, V0=V0, gamma=theta0, derivatives=derivatives)
+
     def stabilityDerivatives(self, alpha, beta, deltas, V_inf=1.0, omega=np.array([0.0, 0.0, 0.0])):
-            """d(CD_i,CY,CL,Cl,Cm,Cn)/d(alpha)"""
+            """d(CD_i,CY,CL,Cl,Cm,Cn)/d(alpha), inviscid, per degree. derivativesAt gives the full jacobian."""
             f = lambda alpha: np.array(self.coefficientsAt(alpha, beta, deltas, V_inf, omega))
             return jax.jacfwd(f)(alpha)
-    
+
     def controlDerivatives(self, alpha, beta, deltas, V_inf=1.0, omega=np.array([0.0, 0.0, 0.0])):
-        """d(CD_i,CY,CL,Cl,Cm,Cn)/d(delta)"""
+        """d(CD_i,CY,CL,Cl,Cm,Cn)/d(delta), inviscid, per degree. derivativesAt gives the full jacobian."""
         f = lambda deltas: np.array(self.coefficientsAt(alpha, beta, deltas, V_inf, omega))
         return jax.jacfwd(f)(deltas)
 
@@ -690,13 +1021,12 @@ class Aircraft():
         x_np = CG_x + MAC * (dCm/dalpha)/(dCL/dalpha), no sweep over CG needed.
         Confirmed against a CG sweep to within float32 noise (~1e-7).
         """
-        reference = max(self.surfaces, key = lambda surf: surf.S)
         d = self.stabilityDerivatives(alpha, beta, deltas)
-        x_np = self.CG[0] + reference.MAC * d[4] / d[2]
+        x_np = self.CG[0] + self.reference.MAC * d[4] / d[2]
         return np.array([x_np, self.CG[1], self.CG[2]])
 
     # Loads Methods
-    def computeLoads(self, alpha, beta, deltas=None, omega=None, V_inf=1.0, rho=1.225, ref_fraction=0.25):
+    def computeLoads(self, alpha, beta, deltas=None, omega=None, V_inf=1.0, rho=None, ref_fraction=0.25):
         """Shear (V), bending (M) and torsion (T) along each surface's span, tip to root, one flight condition."""
         deltas = np.zeros(len(self.control_names)) if deltas is None else deltas
         omega_bar = (np.array([0.0, 0.0, 0.0]) if omega is None else omega) / V_inf
@@ -710,12 +1040,10 @@ class Aircraft():
         AIC = self.computeAIC(normals)
         circulation = self.solveSystem(AIC, normals, V_bar, omega_bar)
 
-        reference = max(self.surfaces, key=lambda surf: surf.S)
-        S_ref = reference.S
-        q_S_ref = 0.5 * rho * V_inf**2 * S_ref
+        S_ref = self.reference.S
+        q_S_ref = 0.5 * (self.rho if rho is None else rho) * V_inf**2 * S_ref
 
-        induced = np.sum(self.influence_aero * circulation[None, :, None], axis=1)
-        V_bar_i = induced - V_bar - np.cross(omega_bar[None, :], self.aero_centers)
+        V_bar_i = self.boundVelocity(circulation, V_bar, omega_bar)
         F_panel = q_S_ref * (2 / S_ref) * np.cross(V_bar_i, self.vortex_b - self.vortex_a) * circulation[:, None]
 
         results = {}
@@ -804,6 +1132,7 @@ class Aircraft():
    
 if __name__ == "__main__":
     
+    
     wing = Surface(span= [0.0, 1.0, 3.5], 
                    chord = [1.75, 1.0, 0.5], 
                    sweep = [10.0, 10.0],
@@ -848,9 +1177,10 @@ if __name__ == "__main__":
                     symmetry = True,
                     airfoils=['0015','0015'],
                     control_surfaces = [dict(name='elevator',
-                                            hinge=0.75, 
-                                            span=(0.15, 0.95), 
-                                            mode='symmetric')])
+                                            hinge=0.75,
+                                            span=(0.15, 0.95),
+                                            mode='symmetric',
+                                            limits=(-25.0, 25.0))])
 
     vTail = Surface(span= [0.0, 1.25], 
                     chord = [0.75, 0.4], 
@@ -865,29 +1195,48 @@ if __name__ == "__main__":
                                             span=(0.05, 0.95), 
                                             mode='symmetric')])
                                       
-    airplane = Aircraft(surfaces = [wing, winglet_right, winglet_left, hTail, vTail],
+    airplane = Aircraft(surfaces = [wing, 
+                                    winglet_right, 
+                                    winglet_left, 
+                                    hTail, 
+                                    vTail],
                         CG = np.array([0.0, 0.0, 0.0]),
-                        M = 0.1, Re = 1e6)
+                        M = 0.1, 
+                        Re = 1e6, 
+                        polar_source = 'neuralfoil',
+                        mass = 50.0,                         # Re = 1e6 on the MAC is ~14 m/s, flown near CL = 0.6
+                        inertia = (60.0, 40.0, 95.0, 0.0))   # Ixx, Iyy, Izz, Ixz [kg m^2], estimates
 
-    width, labels = 9, ('CD', 'CY', 'CL', 'Cl', 'Cm', 'Cn')
-    row_label_width = 4 + max(len(n) for n in airplane.control_names)   # fits "d/d<name>"
-    header = f"\n{'':>{row_label_width}} " + " ".join(f"{name:>{width}}" for name in labels)
+    # Trimmed polar: elevator re-trimmed to Cm = 0 at every alpha, and the glide it flies
+    polar = airplane.trimmedPolar(range(-15, 21, 1), control='elevator', viscous=True)
+    V, gamma, sink = airplane.glideState(polar['CL'], polar['CD'])
 
-    deltas = np.zeros(len(airplane.control_names))
-    # Print polar
-    print(header)
-    for a in range(-10, 11, 1):
-        c  = airplane.coefficientsAt(alpha=float(a), beta=0.0, deltas=deltas, viscous=False)
-        print(f"{f'AoA:{a:.1f}':>{row_label_width}} " + " ".join(f"{v:{width}.4f}" for v in c))
+    print(f"\n{'alpha':>6} {'elevator':>9} {'CL':>8} {'CD':>8} {'L/D':>6} {'V':>7} {'sink':>6}")
+    for i, a in enumerate(polar.alpha):
+        flags = ('' if polar.converged[i] else '  not converged') + ('' if polar.within_limits[i] else '  beyond elevator limits')
+        print(f"{a:6.1f} {polar['elevator'][i]:9.2f} {polar['CL'][i]:8.4f} {polar['CD'][i]:8.5f} "
+              f"{polar['CL'][i]/polar['CD'][i]:6.1f} {V[i]:7.2f} {sink[i]:6.3f}{flags}")
 
-    # Print Derivatives
-    da = airplane.stabilityDerivatives(alpha=float(0.0), beta=0.0, deltas=deltas)
-    dd = airplane.controlDerivatives(alpha=float(0.0), beta=0.0, deltas=deltas)
+    usable = numpy.where(polar.converged & polar.within_limits, sink, numpy.nan)
+    best = int(numpy.nanargmin(usable))
 
-    print(f"\n AoA = 0.0 ")
-    print(f"{'d/dalpha':>{row_label_width}} " + " ".join(f"{v:{width}.4f}" for v in da))
-    for j, name in enumerate(airplane.control_names):
-        print(f"{'d/d'+name:>{row_label_width}} " + " ".join(f"{v:{width}.4f}" for v in dd[:, j]))
+    fig, (ax_lift, ax_speed) = plt.subplots(1, 2, figsize=(11, 4.5))
+    _style_dark(fig, (ax_lift, ax_speed))
+    ax_lift.plot(polar.alpha, polar['CL'], color='white')
+    ax_lift.set_xlabel('alpha [deg]')
+    ax_lift.set_ylabel('CL, trimmed')
+    shown = V <= 3*V[best]   # the near-zero-lift points sit far out in speed
+    ax_speed.plot(V[shown], -sink[shown], color='white')
+    ax_speed.plot(V[best], -sink[best], marker='o', color='tab:red', linestyle='none', label='minimum sink')
+    ax_speed.set_xlabel('V [m/s]')
+    ax_speed.set_ylabel('vertical speed [m/s]')
+    ax_speed.legend(fontsize=8, labelcolor='white', facecolor='black', edgecolor='white')
+    plt.show()
+
+    # Derivatives at the minimum-sink trim (per rad, rates per p_hat, q_hat, r_hat, moments about the CG)
+    print(f"\nMinimum sink: alpha = {polar.alpha[best]:.1f} deg, elevator = {polar['elevator'][best]:.2f} deg, "
+          f"V = {V[best]:.2f} m/s, sink = {sink[best]:.3f} m/s, glide angle = {numpy.degrees(gamma[best]):.2f} deg")
+    print(airplane.derivativesAt(polar.alpha[best], 0.0, polar.deltas[best], viscous=True))
 
     # Plot aircraft
     airplane.plot(plot_control_surfaces = True)
